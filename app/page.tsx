@@ -40,6 +40,7 @@ export default function EmployeePage() {
   const [pendingRestDay, setPendingRestDay] = useState<DayCard | null>(null);
   const [activeWeekMembers, setActiveWeekMembers] = useState<string[] | null>(null);
   const [allRestCounts, setAllRestCounts] = useState<Record<string, number>>({});
+  const [shiftsLoaded, setShiftsLoaded] = useState(false);
 
   const weekDays = useMemo(() => {
     if (!activeWeek) return [];
@@ -170,6 +171,7 @@ export default function EmployeePage() {
         nextRestCounts[row.work_date] = (nextRestCounts[row.work_date] ?? 0) + 1;
       }
       setAllRestCounts(nextRestCounts);
+      setShiftsLoaded(true);
     }
 
     void fetchMyShifts();
@@ -365,6 +367,13 @@ export default function EmployeePage() {
       return;
     }
 
+    // 立即在本地标记该天为排休，防止实时刷新前再次提交
+    setShifts((prev) => prev.map((s) =>
+      s.work_date === pendingRestDay.date
+        ? { ...s, status: "rest" as const, period_id: null }
+        : s,
+    ));
+
     setMessage(data?.message ?? "已设为排休。");
   }
 
@@ -465,7 +474,7 @@ export default function EmployeePage() {
         {!loading && !activeWeek ? <div className="empty-state">管理员还没有配置本周排休计划</div> : null}
 
         {dayCards.map((day) => {
-          const canSetRest = !myRestShift && !day.isRest;
+          const canSetRest = shiftsLoaded && !myRestShift && !day.isRest;
           const isRestFull = day.remainingSlots === 0 && !day.isRest;
 
           return (

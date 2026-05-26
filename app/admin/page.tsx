@@ -51,6 +51,7 @@ export default function AdminPage() {
   const [weekMembers, setWeekMembers] = useState<Record<string, string>>({});
   const [editingMemberWeekId, setEditingMemberWeekId] = useState<string | null>(null);
   const [draftMemberText, setDraftMemberText] = useState("");
+  const [showPendingOnly, setShowPendingOnly] = useState(false);
 
 
   const weekDays = useMemo(() => {
@@ -66,6 +67,13 @@ export default function AdminPage() {
       }, {}),
     [periods],
   );
+
+  const memberNames = useMemo(() => {
+    if (!activeWeek || !weekMembers[activeWeek.id]) return [];
+    return weekMembers[activeWeek.id].split(/\s+/).filter(Boolean);
+  }, [activeWeek, weekMembers]);
+
+  const namesWithShifts = useMemo(() => new Set(shifts.map((s) => s.employee_name)), [shifts]);
 
   const requestSummaries = useMemo(() => {
     const grouped = new Map<string, EmployeeWeekShiftRow[]>();
@@ -207,9 +215,6 @@ export default function AdminPage() {
     setSavingWeekId(week.id);
     setMessage(null);
 
-    if (week.is_active) {
-      await supabase.from("rest_weeks").update({ is_active: false }).eq("is_active", true);
-    }
     const payload = {
       ...(week.id.startsWith("draft-") ? {} : { id: week.id }),
       start_date: week.start_date,
@@ -249,6 +254,7 @@ export default function AdminPage() {
   }
 
   async function deleteWeek(weekId: string) {
+    const week = weeks.find((item) => item.id === weekId);
     setSavingWeekId(weekId);
     setMessage(null);
     if (weekId.startsWith("draft-")) {
@@ -257,6 +263,12 @@ export default function AdminPage() {
       setSavingWeekId(null);
       return;
     }
+    if (week) {
+      await Promise.all([
+        supabase.from("employee_week_shifts").delete().eq("week_start", week.start_date),
+        supabase.from("rest_day_limits").delete().eq("week_start", week.start_date),
+      ]);
+    }
     const { error } = await supabase.from("rest_weeks").delete().eq("id", weekId);
     setSavingWeekId(null);
     if (error) {
@@ -264,6 +276,9 @@ export default function AdminPage() {
       return;
     }
     setWeekMembers((prev) => { const next = { ...prev }; delete next[weekId]; return next; });
+    if (activeWeek?.id === weekId) {
+      setActiveWeek(null);
+    }
     setMessage("排休周已删除。");
   }
 
@@ -377,11 +392,11 @@ export default function AdminPage() {
                     const checked = event.target.checked;
                     setWeeks((current) => current.map((item) => ({
                       ...item,
-                      is_active: item.id === week.id ? checked : checked ? false : item.is_active,
+                      is_active: item.id === week.id ? checked : item.is_active,
                     })));
                     if (checked) setActiveWeek(week);
                   }} />
-                  设为当前启用周
+                  发布此周（生成分享链接）
                 </label>
               </div>
 
@@ -418,6 +433,35 @@ export default function AdminPage() {
                 </div>
               )}
 
+              {week.id.startsWith("draft-") ? null : (
+                <div className="link-row">
+                  <span className="link-url">
+                    {typeof window !== "undefined"
+                      ? `${window.location.origin}/week/${week.id}`
+                      : `/week/${week.id}`}
+                  </span>
+                  <button
+                    className="btn-ghost btn-sm"
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(
+                        `${window.location.origin}/week/${week.id}`,
+                      );
+                      setMessage("链接已复制到剪贴板");
+                    }}
+                  >
+                    复制链接
+                  </button>
+                  <button
+                    className="btn-ghost btn-sm"
+                    type="button"
+                    onClick={() => { setActiveWeek(week); }}
+                  >
+                    查看排班总览
+                  </button>
+                </div>
+              )}
+
               <div className="card-actions-row">
                 <button className="btn-primary btn-sm" type="button" disabled={savingWeekId === week.id} onClick={() => saveWeek(week)}>
                   保存
@@ -442,11 +486,22 @@ export default function AdminPage() {
 
         {/* 周名单显示 */}
         {activeWeek && weekMembers[activeWeek.id] ? (
-          <div className="member-tags">
-            {weekMembers[activeWeek.id].split(/\s+/).filter(Boolean).map((name) => (
-              <span key={name} className="member-tag">{name}</span>
-            ))}
-          </div>
+          <>
+            <div className="member-tags">
+              {(showPendingOnly ? memberNames.filter((n) => !namesWithShifts.has(n)) : memberNames).map((name) => {
+                const hasShifts = namesWithShifts.has(name);
+                return (
+                  <span key={name} className={`member-tag ${hasShifts ? "" : "member-tag-pending"}`}>
+                    {name}
+                  </span>
+                );
+              })}
+            </div>
+            <label className="switch-label" style={{ marginBottom: "16px" }}>
+              <input type="checkbox" checked={showPendingOnly} onChange={(e) => setShowPendingOnly(e.target.checked)} />
+              仅显示未排班
+            </label>
+          </>
         ) : activeWeek ? (
           <p style={{ fontSize: "14px", color: "var(--text-muted)", margin: "0 0 16px" }}>该周尚未设置人员名单</p>
         ) : null}

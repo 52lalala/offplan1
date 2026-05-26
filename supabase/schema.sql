@@ -431,6 +431,24 @@ create table if not exists public.rest_week_members (
   unique (week_id)
 );
 
+-- 级联删除：当删除 rest_weeks 时，自动清理关联的排班和名额数据
+create or replace function public.delete_related_week_data()
+returns trigger
+language plpgsql
+as $$
+begin
+  delete from public.employee_week_shifts where week_start = old.start_date;
+  delete from public.rest_day_limits where week_start = old.start_date;
+  return old;
+end;
+$$;
+
+drop trigger if exists trg_rest_weeks_delete_related on public.rest_weeks;
+create trigger trg_rest_weeks_delete_related
+before delete on public.rest_weeks
+for each row
+execute function public.delete_related_week_data();
+
 drop trigger if exists trg_rest_week_members_updated_at on public.rest_week_members;
 create trigger trg_rest_week_members_updated_at
 before update on public.rest_week_members

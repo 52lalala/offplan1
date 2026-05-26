@@ -547,7 +547,9 @@ select {
 }
 
 .member-tag {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 4px 10px;
   background: #EFF6FF;
   color: #2563EB;
@@ -555,6 +557,13 @@ select {
   font-size: 13px;
   font-weight: 500;
 }
+
+.member-tag-pending {
+  background: #F3F4F6;
+  color: #9CA3AF;
+}
+
+
 
 
 
@@ -626,4 +635,27 @@ select {
 .status-badge.missing {
   background: #F3F4F6;
   color: #9CA3AF; /* 未生成用灰色 */
+}
+
+/* 链接显示行 (多链接分享) */
+.link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  flex-wrap: wrap;
+}
+
+.link-url {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "SF Mono", "Fira Code", monospace;
 }

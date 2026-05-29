@@ -3,7 +3,6 @@ export type RestWeekRow = {
   start_date: string;
   end_date: string;
   is_active: boolean;
-  default_period_id: string | null;
 };
 
 export type RestPeriodRow = {
@@ -13,6 +12,7 @@ export type RestPeriodRow = {
   end_time: string;
   sort_order: number;
   is_active: boolean;
+  week_id: string;
 };
 
 export type DayLimitRow = {
@@ -33,7 +33,6 @@ export type EmployeeWeekShiftRow = {
   week_start: string;
   work_date: string;
   employee_name: string;
-  status: "work" | "rest";
   period_id: string | null;
   created_at: string;
   updated_at: string;

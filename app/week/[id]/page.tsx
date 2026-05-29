@@ -15,7 +15,7 @@ type DayCard = {
   remainingSlots: number;
   isRest: boolean;
   isWeekend: boolean;
-  periodId: string | null;
+  selectedPeriodIds: string[];
 };
 
 const DEFAULT_WEEKDAY_LIMIT = 5;
@@ -51,17 +51,22 @@ export default function WeekSchedulePage() {
     return buildDaysFromRange(week.start_date, week.end_date);
   }, [week]);
 
-  const activePeriods = useMemo(
-    () => periods.filter((item) => item.is_active).sort((a, b) => a.sort_order - b.sort_order),
+  const sortedPeriods = useMemo(
+    () => periods.slice().sort((a, b) => a.sort_order - b.sort_order),
     [periods],
   );
 
-  const myRestShift = useMemo(() => shifts.find((item) => item.status === "rest"), [shifts]);
+  const maxSelectable = useMemo(
+    () => periods.filter((p) => p.is_active).length,
+    [periods],
+  );
+
+  const myRestDay = useMemo(() => shifts.find((item) => item.period_id === null), [shifts]);
 
   const dayCards = useMemo<DayCard[]>(() => {
     return weekDays.map((day) => {
       const usedSlots = allRestCounts[day.key] ?? 0;
-      const myShift = shifts.find((item) => item.work_date === day.key);
+      const dayShifts = shifts.filter((item) => item.work_date === day.key);
       const maxSlots = dayLimits[day.key] ?? getDefaultLimit(day.key);
 
       return {
@@ -70,12 +75,12 @@ export default function WeekSchedulePage() {
         weekdayLabel: day.weekdayLabel,
         maxSlots,
         remainingSlots: Math.max(0, maxSlots - usedSlots),
-        isRest: myShift?.status === "rest",
+        isRest: dayShifts.some((s) => s.period_id === null),
         isWeekend: day.isWeekend,
-        periodId: myShift?.period_id ?? week?.default_period_id ?? null,
+        selectedPeriodIds: dayShifts.filter((s) => s.period_id !== null).map((s) => s.period_id!),
       };
     });
-  }, [week?.default_period_id, allRestCounts, dayLimits, shifts, weekDays]);
+  }, [allRestCounts, dayLimits, shifts, weekDays]);
 
   useEffect(() => {
     async function loadWeek() {
@@ -83,13 +88,13 @@ export default function WeekSchedulePage() {
       const [weekResponse, periodsResponse] = await Promise.all([
         supabase
           .from("rest_weeks")
-          .select("id,start_date,end_date,is_active,default_period_id")
+          .select("id,start_date,end_date,is_active")
           .eq("id", weekId)
           .maybeSingle(),
         supabase
           .from("rest_periods")
-          .select("id,name,start_time,end_time,sort_order,is_active")
-          .order("sort_order", { ascending: true }),
+          .select("id,name,start_time,end_time,sort_order,is_active,week_id")
+          .eq("week_id", weekId),
       ]);
       setWeek(weekResponse.data ?? null);
       setPeriods(periodsResponse.data ?? []);
@@ -127,9 +132,22 @@ export default function WeekSchedulePage() {
         .eq("week_id", currentWeek.id)
         .maybeSingle();
       if (data?.members?.trim()) {
-        setActiveWeekMembers(data.members.split(/\s+/).filter(Boolean));
+        const members = data.members.split(/\s+/).filter(Boolean);
+        setActiveWeekMembers(members);
+        const storedName = window.localStorage.getItem(STORAGE_KEY)?.trim() ?? "";
+        if (storedName && !members.includes(storedName)) {
+          setEmployeeName("");
+          setDraftName("");
+          setShowNameGate(true);
+        }
       } else {
         setActiveWeekMembers(null);
+        const storedName = window.localStorage.getItem(STORAGE_KEY)?.trim() ?? "";
+        if (storedName) {
+          setEmployeeName("");
+          setDraftName("");
+          setShowNameGate(true);
+        }
       }
     }
     void fetchMembers();
@@ -142,11 +160,16 @@ export default function WeekSchedulePage() {
         return;
       }
 
+      await supabase.rpc("init_employee_week_shifts", {
+        p_week_start: week.start_date,
+        p_employee_name: employeeName.trim(),
+      });
+
       const [limitsResponse, shiftsResponse, restCountsResponse] = await Promise.all([
         supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", week.start_date),
         supabase
           .from("employee_week_shifts")
-          .select("id,week_start,work_date,employee_name,status,period_id,created_at,updated_at")
+          .select("id,week_start,work_date,employee_name,period_id,created_at,updated_at")
           .eq("week_start", week.start_date)
           .eq("employee_name", employeeName.trim())
           .order("work_date", { ascending: true }),
@@ -154,7 +177,7 @@ export default function WeekSchedulePage() {
           .from("employee_week_shifts")
           .select("work_date")
           .eq("week_start", week.start_date)
-          .eq("status", "rest"),
+          .is("period_id", null),
       ]);
 
       if (limitsResponse.data) {
@@ -195,7 +218,7 @@ export default function WeekSchedulePage() {
           const [shiftsResponse, restCountsResponse] = await Promise.all([
             supabase
               .from("employee_week_shifts")
-              .select("id,week_start,work_date,employee_name,status,period_id,created_at,updated_at")
+              .select("id,week_start,work_date,employee_name,period_id,created_at,updated_at")
               .eq("week_start", week.start_date)
               .eq("employee_name", employeeName.trim())
               .order("work_date", { ascending: true }),
@@ -203,7 +226,7 @@ export default function WeekSchedulePage() {
               .from("employee_week_shifts")
               .select("work_date")
               .eq("week_start", week.start_date)
-              .eq("status", "rest"),
+              .is("period_id", null),
           ]);
 
           setShifts(shiftsResponse.data ?? []);
@@ -333,12 +356,10 @@ export default function WeekSchedulePage() {
     setSubmittingKey(pendingRestDay.date);
     setMessage(null);
 
-    const { data, error } = await supabase.rpc("update_employee_shift", {
+    const { data, error } = await supabase.rpc("set_employee_rest", {
       p_week_start: week.start_date,
       p_work_date: pendingRestDay.date,
       p_employee_name: employeeName.trim(),
-      p_status: "rest",
-      p_period_id: null,
     });
 
     setSubmittingKey(null);
@@ -349,16 +370,25 @@ export default function WeekSchedulePage() {
       return;
     }
 
-    setShifts((prev) => prev.map((s) =>
-      s.work_date === pendingRestDay.date
-        ? { ...s, status: "rest" as const, period_id: null }
-        : s,
-    ));
-
     setMessage(data?.message ?? "已设为排休。");
+    await refetchMyShifts();
   }
 
-  async function handleUpdatePeriod(workDate: string, periodId: string) {
+  async function refetchMyShifts() {
+    if (!week || !employeeName.trim()) {
+      setShifts([]);
+      return;
+    }
+    const { data } = await supabase
+      .from("employee_week_shifts")
+      .select("id,week_start,work_date,employee_name,period_id,created_at,updated_at")
+      .eq("week_start", week.start_date)
+      .eq("employee_name", employeeName.trim())
+      .order("work_date", { ascending: true });
+    setShifts(data ?? []);
+  }
+
+  async function handleTogglePeriod(workDate: string, periodId: string) {
     if (!week || !employeeName.trim()) {
       setMessage("请先确认姓名。");
       return;
@@ -367,11 +397,10 @@ export default function WeekSchedulePage() {
     setSubmittingKey(`${workDate}-${periodId}`);
     setMessage(null);
 
-    const { data, error } = await supabase.rpc("update_employee_shift", {
+    const { data, error } = await supabase.rpc("toggle_employee_period", {
       p_week_start: week.start_date,
       p_work_date: workDate,
       p_employee_name: employeeName.trim(),
-      p_status: "work",
       p_period_id: periodId,
     });
 
@@ -382,7 +411,8 @@ export default function WeekSchedulePage() {
       return;
     }
 
-    setMessage(data?.message ?? "出勤时段已更新。");
+    setMessage(data?.message ?? "时段已切换。");
+    await refetchMyShifts();
   }
 
   if (weekLoading) {
@@ -474,7 +504,7 @@ export default function WeekSchedulePage() {
 
       <section className="calendar-grid">
         {dayCards.map((day) => {
-          const canSetRest = shiftsLoaded && !myRestShift && !day.isRest;
+          const hasRestOnOtherDay = myRestDay !== undefined && myRestDay.work_date !== day.date && !day.isRest;
           const isRestFull = day.remainingSlots === 0 && !day.isRest;
 
           return (
@@ -494,28 +524,33 @@ export default function WeekSchedulePage() {
                   <div className="status-rested">已设为排休</div>
                 ) : (
                   <>
+                    <div className="period-hint">必须选择 {maxSelectable} 个时段</div>
                     <div className="segment-control">
-                      {activePeriods.map((period) => (
-                        <button
-                          key={period.id}
-                          className={`segment-btn ${day.periodId === period.id ? "active" : ""}`}
-                          type="button"
-                          disabled={submittingKey !== null}
-                          onClick={() => handleUpdatePeriod(day.date, period.id)}
-                        >
-                          {period.name}
-                        </button>
-                      ))}
+                      {sortedPeriods.map((period) => {
+                        const isSelected = day.selectedPeriodIds.includes(period.id);
+                        return (
+                          <button
+                            key={period.id}
+                            className={`segment-btn ${isSelected ? "active" : ""}`}
+                            type="button"
+                            disabled={submittingKey !== null}
+                            onClick={() => handleTogglePeriod(day.date, period.id)}
+                          >
+                            {period.name}
+                          </button>
+                        );
+                      })}
                     </div>
+                    <div className="period-count">已选 {maxSelectable} 个固定时段</div>
 
-                    {canSetRest ? (
+                    {shiftsLoaded ? (
                       <button
                         className="btn-rest"
                         type="button"
-                        disabled={!week || isRestFull || submittingKey !== null}
+                        disabled={!week || isRestFull || hasRestOnOtherDay || submittingKey !== null}
                         onClick={() => openRestConfirm(day.date)}
                       >
-                        申请排休
+                        {hasRestOnOtherDay ? "本周已排休" : isRestFull ? "名额已满" : "申请排休"}
                       </button>
                     ) : null}
                   </>

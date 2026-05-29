@@ -16,7 +16,7 @@ export default function HomePage() {
       setLoading(true);
       const { data } = await supabase
         .from("rest_weeks")
-        .select("id,start_date,end_date,is_active,default_period_id")
+        .select("id,start_date,end_date,is_active")
         .eq("is_active", true)
         .order("start_date", { ascending: false });
       const list = data ?? [];

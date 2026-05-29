@@ -17,7 +17,7 @@ function formatPeriodLabel(period: RestPeriodRow) {
   return `${period.name} ${period.start_time.slice(0, 5)}-${period.end_time.slice(0, 5)}`;
 }
 
-function createDraftPeriod(sortOrder: number): RestPeriodRow {
+function createDraftPeriod(weekId: string, sortOrder: number): RestPeriodRow {
   return {
     id: `draft-${crypto.randomUUID()}`,
     name: "",
@@ -25,6 +25,7 @@ function createDraftPeriod(sortOrder: number): RestPeriodRow {
     end_time: "13:30:00",
     sort_order: sortOrder,
     is_active: true,
+    week_id: weekId,
   };
 }
 
@@ -34,7 +35,6 @@ function createDraftWeek(): RestWeekRow {
     start_date: "",
     end_date: "",
     is_active: false,
-    default_period_id: null,
   };
 }
 
@@ -88,21 +88,28 @@ export default function AdminPage() {
     return Array.from(grouped.entries())
       .sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))
       .map(([employeeName, employeeShifts]) => {
-        const shiftsByDate = new Map(employeeShifts.map((item) => [item.work_date, item]));
+        const shiftsByDate = new Map<string, EmployeeWeekShiftRow[]>();
+        for (const shift of employeeShifts) {
+          const list = shiftsByDate.get(shift.work_date) ?? [];
+          list.push(shift);
+          shiftsByDate.set(shift.work_date, list);
+        }
         const weekSummary = weekDays.map((day) => {
-          const shift = shiftsByDate.get(day.key);
+          const dayShifts = shiftsByDate.get(day.key);
 
-          if (!shift) {
+          if (!dayShifts || dayShifts.length === 0) {
             return `${day.weekdayLabel} 未生成`;
           }
 
-          if (shift.status === "rest") {
+          const restShift = dayShifts.find((s) => s.period_id === null);
+          if (restShift) {
             return `${day.weekdayLabel} 排休`;
           }
 
-          return `${day.weekdayLabel} ${
-            periodMap[shift.period_id ?? ""] ? periodMap[shift.period_id ?? ""].name : "未设时段"
-          }`;
+          const periodNames = dayShifts
+            .filter((s) => s.period_id !== null)
+            .map((s) => (periodMap[s.period_id!] ? periodMap[s.period_id!].name : "未设时段"));
+          return `${day.weekdayLabel} ${periodNames.join("、")}`;
         });
 
         return {
@@ -117,8 +124,8 @@ export default function AdminPage() {
   useEffect(() => {
     async function loadData() {
       const [weeksResponse, periodsResponse, membersResponse] = await Promise.all([
-        supabase.from("rest_weeks").select("id,start_date,end_date,is_active,default_period_id").order("start_date", { ascending: false }),
-        supabase.from("rest_periods").select("id,name,start_time,end_time,sort_order,is_active").order("sort_order", { ascending: true }),
+        supabase.from("rest_weeks").select("id,start_date,end_date,is_active").order("start_date", { ascending: false }),
+        supabase.from("rest_periods").select("id,name,start_time,end_time,sort_order,is_active,week_id").order("sort_order", { ascending: true }),
         supabase.from("rest_week_members").select("week_id,members"),
       ]);
       if (weeksResponse.data) {
@@ -148,7 +155,7 @@ export default function AdminPage() {
     async function loadWeekData() {
       const [limitsResponse, shiftsResponse] = await Promise.all([
         supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", weekStart),
-        supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,status,period_id,created_at,updated_at").eq("week_start", weekStart).order("employee_name", { ascending: true }).order("work_date", { ascending: true }),
+        supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,period_id,created_at,updated_at").eq("week_start", weekStart).order("employee_name", { ascending: true }).order("work_date", { ascending: true }),
       ]);
       const nextLimits = (limitsResponse.data ?? []).reduce<Record<string, number>>((acc, row) => {
         acc[row.rest_date] = row.max_slots;
@@ -164,7 +171,7 @@ export default function AdminPage() {
     const channel = supabase
       .channel(`admin-sync-${activeWeek?.start_date ?? "none"}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "rest_weeks" }, async () => {
-        const { data } = await supabase.from("rest_weeks").select("id,start_date,end_date,is_active,default_period_id").order("start_date", { ascending: false });
+        const { data } = await supabase.from("rest_weeks").select("id,start_date,end_date,is_active").order("start_date", { ascending: false });
         if (data) {
           setWeeks(data);
           setActiveWeek((current) => {
@@ -174,7 +181,7 @@ export default function AdminPage() {
         }
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "rest_periods" }, async () => {
-        const { data } = await supabase.from("rest_periods").select("id,name,start_time,end_time,sort_order,is_active").order("sort_order", { ascending: true });
+        const { data } = await supabase.from("rest_periods").select("id,name,start_time,end_time,sort_order,is_active,week_id").order("sort_order", { ascending: true });
         if (data) setPeriods(data);
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "rest_day_limits", filter: activeWeek ? `week_start=eq.${activeWeek.start_date}` : undefined }, async () => {
@@ -188,7 +195,7 @@ export default function AdminPage() {
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "employee_week_shifts", filter: activeWeek ? `week_start=eq.${activeWeek.start_date}` : undefined }, async () => {
         if (!activeWeek) return;
-        const { data } = await supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,status,period_id,created_at,updated_at").eq("week_start", activeWeek.start_date).order("employee_name", { ascending: true }).order("work_date", { ascending: true });
+        const { data } = await supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,period_id,created_at,updated_at").eq("week_start", activeWeek.start_date).order("employee_name", { ascending: true }).order("work_date", { ascending: true });
         setShifts(data ?? []);
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "rest_week_members" }, async () => {
@@ -215,14 +222,14 @@ export default function AdminPage() {
     setSavingWeekId(week.id);
     setMessage(null);
 
+    const isDraft = week.id.startsWith("draft-");
     const payload = {
-      ...(week.id.startsWith("draft-") ? {} : { id: week.id }),
+      ...(isDraft ? {} : { id: week.id }),
       start_date: week.start_date,
       end_date: week.end_date,
       is_active: week.is_active,
-      default_period_id: week.default_period_id,
     };
-    const { error } = await supabase.from("rest_weeks").upsert(payload);
+    const { data, error } = await supabase.from("rest_weeks").upsert(payload).select("id").single();
 
     if (error) {
       setSavingWeekId(null);
@@ -230,14 +237,32 @@ export default function AdminPage() {
       return;
     }
 
-    if (week.id.startsWith("draft-")) {
+    const newWeekId = data?.id ?? week.id;
+
+    if (isDraft) {
+      const sourceWeek = weeks
+        .filter((w) => !w.id.startsWith("draft-") && periods.some((p) => p.week_id === w.id))
+        .sort((a, b) => b.end_date.localeCompare(a.end_date))[0];
+
+      if (sourceWeek) {
+        await supabase.rpc("clone_week_periods", {
+          p_source_week_id: sourceWeek.id,
+          p_target_week_id: newWeekId,
+        });
+        const { data: newPeriods } = await supabase
+          .from("rest_periods")
+          .select("id,name,start_time,end_time,sort_order,is_active,week_id")
+          .order("sort_order", { ascending: true });
+        if (newPeriods) setPeriods(newPeriods);
+      }
+
       setWeeks((current) => current.filter((item) => item.id !== week.id));
     }
 
     // 一并保存周名单
     if (editingMemberWeekId === week.id) {
       const { error: memberError } = await supabase.from("rest_week_members").upsert(
-        { week_id: week.id, members: draftMemberText },
+        { week_id: newWeekId, members: draftMemberText },
         { onConflict: "week_id" },
       );
       if (memberError) {
@@ -245,7 +270,7 @@ export default function AdminPage() {
         setMessage(memberError.message);
         return;
       }
-      setWeekMembers((prev) => ({ ...prev, [week.id]: draftMemberText }));
+      setWeekMembers((prev) => ({ ...prev, [newWeekId]: draftMemberText }));
       setEditingMemberWeekId(null);
     }
 
@@ -297,6 +322,7 @@ export default function AdminPage() {
       end_time: period.end_time,
       sort_order: period.sort_order,
       is_active: period.is_active,
+      week_id: period.week_id,
     };
     const { error } = await supabase.from("rest_periods").upsert(payload);
     setSavingPeriodId(null);
@@ -381,12 +407,6 @@ export default function AdminPage() {
               <div className="input-group">
                 <input type="date" className="clean-input" value={week.start_date} onChange={(event) => setWeeks((current) => current.map((item) => item.id === week.id ? { ...item, start_date: event.target.value } : item))} />
                 <input type="date" className="clean-input" value={week.end_date} onChange={(event) => setWeeks((current) => current.map((item) => item.id === week.id ? { ...item, end_date: event.target.value } : item))} />
-                <select className="clean-input" value={week.default_period_id ?? ""} onChange={(event) => setWeeks((current) => current.map((item) => item.id === week.id ? { ...item, default_period_id: event.target.value || null } : item))}>
-                  <option value="">选择默认班次</option>
-                  {periods.filter((item) => item.is_active).map((period) => (
-                    <option key={period.id} value={period.id}>{period.name}</option>
-                  ))}
-                </select>
                 <label className="switch-label">
                   <input type="checkbox" checked={week.is_active} onChange={(event) => {
                     const checked = event.target.checked;
@@ -432,6 +452,37 @@ export default function AdminPage() {
                   </button>
                 </div>
               )}
+
+              {/* 本周时段配置 */}
+              <div className="period-subsection">
+                <div className="period-subsection-header">
+                  <span className="period-subsection-title">时段配置</span>
+                  <button className="btn-ghost btn-sm" type="button" onClick={() => {
+                    const weekPeriods = periods.filter((p) => p.week_id === week.id);
+                    setPeriods((current) => [...current, createDraftPeriod(week.id, weekPeriods.length + 1)]);
+                  }}>
+                    + 新增时段
+                  </button>
+                </div>
+                {periods.filter((p) => p.week_id === week.id).sort((a, b) => a.sort_order - b.sort_order).map((period) => (
+                    <div className="period-row" key={period.id}>
+                      <div className="period-inputs">
+                        <input className="clean-input period-name" value={period.name} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, name: event.target.value } : item))} placeholder="时段名称" />
+                        <input type="time" className="clean-input period-time" value={period.start_time.slice(0, 5)} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, start_time: `${event.target.value}:00` } : item))} />
+                        <input type="time" className="clean-input period-time" value={period.end_time.slice(0, 5)} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, end_time: `${event.target.value}:00` } : item))} />
+                        <input type="number" className="clean-input period-sort" min={0} value={period.sort_order} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, sort_order: Number(event.target.value) } : item))} placeholder="排序" />
+                        <label className="switch-label">
+                          <input type="checkbox" checked={period.is_active} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, is_active: event.target.checked } : item))} />
+                          启用
+                        </label>
+                      </div>
+                      <div className="card-actions-row">
+                        <button className="btn-primary btn-sm" type="button" disabled={savingPeriodId === period.id} onClick={() => savePeriod(period)}>保存</button>
+                        <button className="btn-ghost btn-sm" type="button" disabled={savingPeriodId === period.id} onClick={() => deletePeriod(period.id)}>删除</button>
+                      </div>
+                    </div>
+                ))}
+              </div>
 
               {week.id.startsWith("draft-") ? null : (
                 <div className="link-row">
@@ -542,41 +593,7 @@ export default function AdminPage() {
         )}
       </section>
 
-      {/* 时段配置 */}
-      <section className="admin-section">
-        <div className="section-header">
-          <div>
-            <h2>时段配置</h2>
-            <p>维护所有可选的上班时段</p>
-          </div>
-          <button className="btn-primary btn-sm" type="button" onClick={() => setPeriods((current) => [...current, createDraftPeriod(current.length + 1)])}>
-            + 新增时段
-          </button>
-        </div>
-
-        <div className="config-grid">
-          {periods.slice().sort((a, b) => a.sort_order - b.sort_order).map((period) => (
-            <div className="config-card" key={period.id}>
-              <div className="input-group">
-                <input className="clean-input" value={period.name} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, name: event.target.value } : item))} placeholder="时段名称 (如: 早班)" />
-                <input type="time" className="clean-input" value={period.start_time.slice(0, 5)} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, start_time: `${event.target.value}:00` } : item))} />
-                <input type="time" className="clean-input" value={period.end_time.slice(0, 5)} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, end_time: `${event.target.value}:00` } : item))} />
-                <input type="number" className="clean-input" min={0} value={period.sort_order} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, sort_order: Number(event.target.value) } : item))} placeholder="排序序号" />
-                <label className="switch-label">
-                  <input type="checkbox" checked={period.is_active} onChange={(event) => setPeriods((current) => current.map((item) => item.id === period.id ? { ...item, is_active: event.target.checked } : item))} />
-                  启用时段
-                </label>
-              </div>
-              <div className="card-actions-row">
-                <button className="btn-primary btn-sm" type="button" disabled={savingPeriodId === period.id} onClick={() => savePeriod(period)}>保存</button>
-                <button className="btn-ghost btn-sm" type="button" disabled={savingPeriodId === period.id} onClick={() => deletePeriod(period.id)}>删除</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* 核心改动：每日排休名额设置（改造成类似配置卡片的自适应网格） */}
+      {/* 每日排休名额设置 */}
       <section className="admin-section">
         <div className="section-header">
           <div>
@@ -587,7 +604,7 @@ export default function AdminPage() {
 
         <div className="config-grid">
           {weekDays.map((day) => {
-            const usedSlots = shifts.filter((item) => item.work_date === day.key && item.status === "rest").length;
+            const usedSlots = shifts.filter((item) => item.work_date === day.key && item.period_id === null).length;
             const maxSlots = limits[day.key] ?? getDefaultLimit(day.key);
 
             return (

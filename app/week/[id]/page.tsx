@@ -39,6 +39,7 @@ export default function WeekSchedulePage() {
   const [shifts, setShifts] = useState<EmployeeWeekShiftRow[]>([]);
   const [periods, setPeriods] = useState<RestPeriodRow[]>([]);
   const [submittingKey, setSubmittingKey] = useState<string | null>(null);
+  const [togglingPeriods, setTogglingPeriods] = useState<Record<string, boolean>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [showNameGate, setShowNameGate] = useState(false);
   const [pendingRestDay, setPendingRestDay] = useState<DayCard | null>(null);
@@ -394,8 +395,21 @@ export default function WeekSchedulePage() {
       return;
     }
 
-    setSubmittingKey(`${workDate}-${periodId}`);
+    const key = `${workDate}-${periodId}`;
+    if (togglingPeriods[key]) return;
+
+    setTogglingPeriods((prev) => ({ ...prev, [key]: true }));
     setMessage(null);
+
+    // Optimistic: 立即翻转选中状态
+    setShifts((prev) => {
+      const exists = prev.find((s) => s.work_date === workDate && s.period_id === periodId);
+      if (exists) {
+        return prev.filter((s) => s !== exists);
+      }
+      const dummy = { id: "opt-" + periodId, week_start: week.start_date, work_date: workDate, employee_name: employeeName.trim(), period_id: periodId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+      return [...prev.filter((s) => s.work_date !== workDate || s.period_id === null), dummy];
+    });
 
     const { data, error } = await supabase.rpc("toggle_employee_period", {
       p_week_start: week.start_date,
@@ -404,21 +418,24 @@ export default function WeekSchedulePage() {
       p_period_id: periodId,
     });
 
-    setSubmittingKey(null);
-
     if (error) {
       setMessage(error.message);
+      await refetchMyShifts();
+      setTogglingPeriods((prev) => ({ ...prev, [key]: false }));
       return;
     }
 
-    setMessage(data?.message ?? "时段已切换。");
     await refetchMyShifts();
+    setTogglingPeriods((prev) => ({ ...prev, [key]: false }));
   }
 
   if (weekLoading) {
     return (
       <main className="page-container">
-        <div className="empty-state">数据加载中...</div>
+        <div className="loading-spinner">
+          <div className="spinner" />
+          <span className="loading-text">加载中...</span>
+        </div>
       </main>
     );
   }
@@ -446,7 +463,7 @@ export default function WeekSchedulePage() {
             <h3>
               {pendingRestDay.weekdayLabel} {pendingRestDay.shortDate}
             </h3>
-            <p className="confirm-copy">确定后将设为排休，当前剩余 <strong>{pendingRestDay.remainingSlots}</strong> 个名额，提交后不可修改。</p>
+            <p className="confirm-copy">确定后将设为排休，当前剩余 <strong>{pendingRestDay.remainingSlots}</strong> 个排休空位，提交后不可修改。</p>
             <div className="confirm-actions">
               <button
                 className="btn-secondary"
@@ -462,7 +479,7 @@ export default function WeekSchedulePage() {
                 onClick={confirmSetRest}
                 disabled={submittingKey === pendingRestDay.date}
               >
-                确定排休
+                {submittingKey === pendingRestDay.date ? "提交中..." : "确定排休"}
               </button>
             </div>
           </section>
@@ -515,7 +532,7 @@ export default function WeekSchedulePage() {
                   <span>{day.shortDate}</span>
                 </div>
                 <div className={`quota-pill ${day.remainingSlots === 0 ? "full" : ""}`}>
-                  {day.remainingSlots > 0 ? `剩 ${day.remainingSlots} 名额` : "名额已满"}
+                  {day.remainingSlots > 0 ? `剩余 ${day.remainingSlots} 排休空位` : "排休人数已满"}
                 </div>
               </div>
 
@@ -524,16 +541,15 @@ export default function WeekSchedulePage() {
                   <div className="status-rested">已设为排休</div>
                 ) : (
                   <>
-                    <div className="period-hint">必须选择 {maxSelectable} 个时段</div>
                     <div className="segment-control">
                       {sortedPeriods.map((period) => {
                         const isSelected = day.selectedPeriodIds.includes(period.id);
                         return (
                           <button
                             key={period.id}
+                            style={{ WebkitTapHighlightColor: "transparent" }} /* 消除移动端点击闪烁问题 */
                             className={`segment-btn ${isSelected ? "active" : ""}`}
                             type="button"
-                            disabled={submittingKey !== null}
                             onClick={() => handleTogglePeriod(day.date, period.id)}
                           >
                             {period.name}
@@ -541,8 +557,6 @@ export default function WeekSchedulePage() {
                         );
                       })}
                     </div>
-                    <div className="period-count">已选 {maxSelectable} 个固定时段</div>
-
                     {shiftsLoaded ? (
                       <button
                         className="btn-rest"
@@ -550,7 +564,7 @@ export default function WeekSchedulePage() {
                         disabled={!week || isRestFull || hasRestOnOtherDay || submittingKey !== null}
                         onClick={() => openRestConfirm(day.date)}
                       >
-                        {hasRestOnOtherDay ? "本周已排休" : isRestFull ? "名额已满" : "申请排休"}
+                        {hasRestOnOtherDay ? "本周已排休" : isRestFull ? "排休人数已满" : "申请排休"}
                       </button>
                     ) : null}
                   </>

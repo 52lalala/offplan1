@@ -4,18 +4,18 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { formatWeekRange } from "@/lib/date";
 import { supabase } from "@/lib/supabase";
-import type { RestWeekRow } from "@/lib/types";
+import type { ScheduleWeekRow } from "@/lib/types";
 
 export default function HomePage() {
   const router = useRouter();
-  const [weeks, setWeeks] = useState<RestWeekRow[]>([]);
+  const [weeks, setWeeks] = useState<ScheduleWeekRow[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     async function load() {
       setLoading(true);
       const { data } = await supabase
-        .from("rest_weeks")
+        .from("schedule_weeks")
         .select("id,start_date,end_date,is_active")
         .eq("is_active", true)
         .order("start_date", { ascending: false });

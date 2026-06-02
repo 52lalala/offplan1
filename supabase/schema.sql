@@ -1,5 +1,5 @@
 -- ==========================================================
--- 排班系统数据库结构
+-- 排班系统数据库结构（基于骑手意愿导入 + 协同排班）
 -- 每次执行会清空所有表后重建
 -- ==========================================================
 
@@ -8,14 +8,20 @@ create extension if not exists pgcrypto;
 
 -- ==================== 2. 清空旧数据 ====================
 drop table if exists public.rest_week_members cascade;
-drop table if exists public.employee_week_shifts cascade;
 drop table if exists public.rest_periods cascade;
+drop table if exists public.employee_week_shifts cascade;
+drop table if exists public.rider_schedules cascade;
+drop table if exists public.rider_week_rosters cascade;
+drop table if exists public.time_slots cascade;
+drop table if exists public.riders cascade;
 drop table if exists public.rest_day_limits cascade;
 drop table if exists public.rest_weeks cascade;
+drop table if exists public.schedule_weeks cascade;
 
 -- ==================== 3. 建表 ====================
 
-create table public.rest_weeks (
+-- 排班周
+create table public.schedule_weeks (
   id uuid primary key default gen_random_uuid(),
   start_date date not null,
   end_date date not null,
@@ -25,88 +31,426 @@ create table public.rest_weeks (
   check (end_date >= start_date)
 );
 
-create table public.rest_periods (
+-- 时段定义
+create table public.time_slots (
   id uuid primary key default gen_random_uuid(),
+  week_id uuid not null references public.schedule_weeks(id) on delete cascade,
   name text not null check (char_length(trim(name)) between 1 and 30),
   start_time time not null,
   end_time time not null,
   sort_order integer not null default 0,
+  is_selectable boolean not null default true,
   is_active boolean not null default true,
-  week_id uuid not null references public.rest_weeks(id) on delete cascade,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
+-- 骑手表
+create table public.riders (
+  rider_id text primary key,
+  name text not null check (char_length(trim(name)) between 1 and 20),
+  group_id text not null default '',
+  group_name text not null default '',
+  rider_type text not null default '',
+  min_slots integer not null default 1 check (min_slots >= 0 and min_slots <= 10),
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+-- 每日排休名额
 create table public.rest_day_limits (
   id uuid primary key default gen_random_uuid(),
   week_start date not null,
   rest_date date not null,
-  max_slots integer not null check (max_slots >= 0 and max_slots <= 20),
+  max_slots integer not null check (max_slots >= 0 and max_slots <= 50),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (week_start, rest_date)
 );
 
-create table public.employee_week_shifts (
+-- 骑手排班明细
+-- slot_id is null => 该骑手当天排休
+-- slot_id is not null => is_selected 标记该时段是否出勤
+create table public.rider_schedules (
   id uuid primary key default gen_random_uuid(),
-  week_start date not null,
+  rider_id text not null references public.riders(rider_id) on delete cascade,
+  week_id uuid not null references public.schedule_weeks(id) on delete cascade,
   work_date date not null,
-  employee_name text not null check (char_length(trim(employee_name)) between 1 and 20),
-  rider_id text not null default '',
-  period_id uuid references public.rest_periods(id) on update cascade on delete set null,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-create table public.rest_week_members (
-  id uuid primary key default gen_random_uuid(),
-  week_id uuid not null references public.rest_weeks(id) on delete cascade,
-  members text not null default '',
+  slot_id uuid references public.time_slots(id) on delete cascade,
+  is_selected boolean,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique (week_id)
+  unique (rider_id, work_date, slot_id)
 );
 
 -- ==================== 4. 索引 ====================
 
-create unique index idx_employee_shift_period
-  on public.employee_week_shifts (rider_id, work_date, period_id)
-  where period_id is not null;
+-- 每个骑手每天最多一条排休记录
+create unique index idx_rs_rest on public.rider_schedules (rider_id, work_date) where slot_id is null;
 
-create unique index idx_employee_shift_rest
-  on public.employee_week_shifts (rider_id, work_date)
-  where period_id is null;
+-- 每个骑手每天每时段最多一条记录
+create unique index idx_rs_slot on public.rider_schedules (rider_id, work_date, slot_id) where slot_id is not null;
 
-create index idx_rest_periods_sort on public.rest_periods (sort_order, is_active);
-create index idx_rest_weeks_active on public.rest_weeks (is_active, start_date desc);
-create index idx_rest_day_limits_week_date on public.rest_day_limits (week_start, rest_date);
-create index idx_employee_week_shifts_week_date on public.employee_week_shifts (week_start, work_date);
-create index idx_employee_week_shifts_rider_week on public.employee_week_shifts (rider_id, week_start);
+create index idx_rs_week on public.rider_schedules (week_id);
+create index idx_rs_rider_week on public.rider_schedules (rider_id, week_id);
+create index idx_rs_work_date on public.rider_schedules (work_date);
+create index idx_ts_week on public.time_slots (week_id, sort_order);
+create index idx_rdl_week on public.rest_day_limits (week_start);
+create index idx_sw_active on public.schedule_weeks (is_active, start_date desc);
 
 -- ==================== 5. 函数 ====================
 
--- 更新时间触发器
 create or replace function public.set_updated_at()
-returns trigger language plpgsql
-as $$
+returns trigger language plpgsql as $$
 begin
   new.updated_at = now();
   return new;
 end;
 $$;
 
--- 级联删除周数据
-create or replace function public.delete_related_week_data()
-returns trigger language plpgsql
+-- 批量导入 XLS 数据（事务内完成）
+-- p_data jsonb 格式：
+-- {
+--   "weekStart": "2026-06-01",
+--   "weekEnd": "2026-06-07",
+--   "group": {"id":"...","name":"..."},
+--   "slots": [{"name":"午高峰","startTime":"10:30","endTime":"13:30","sortOrder":1}, ...],
+--   "entries": [
+--     {"riderId":"4598058","riderName":"龚传仓","date":"20260601","selections":[1,0,0,0,0,0]},
+--     ...
+--   ]
+-- }
+create or replace function public.import_xls_week(p_week_id uuid, p_data jsonb)
+returns jsonb language plpgsql
 as $$
+declare
+  v_week_start date;
+  v_week_end date;
+  v_group_id text;
+  v_group_name text;
+  v_slot jsonb;
+  v_slot_ids uuid[];
+  v_entry jsonb;
+  v_selections jsonb;
+  v_idx int;
+  v_rider_id text;
+  v_rider_name text;
+  v_date text;
+  v_all_zero boolean;
 begin
-  delete from public.employee_week_shifts where week_start = old.start_date;
-  delete from public.rest_day_limits where week_start = old.start_date;
-  return old;
+  -- 解析基本信息
+  v_week_start := (p_data->>'weekStart')::date;
+  v_week_end := (p_data->>'weekEnd')::date;
+  v_group_id := p_data->'group'->>'id';
+  v_group_name := p_data->'group'->>'name';
+
+  -- 清空该周旧数据
+  delete from public.rider_schedules where week_id = p_week_id;
+  delete from public.time_slots where week_id = p_week_id;
+
+  -- 创建时段
+  for v_slot in select * from jsonb_array_elements(p_data->'slots')
+  loop
+    insert into public.time_slots (week_id, name, start_time, end_time, sort_order, is_selectable)
+    values (
+      p_week_id,
+      v_slot->>'name',
+      (v_slot->>'startTime')::time,
+      (v_slot->>'endTime')::time,
+      (v_slot->>'sortOrder')::int,
+      true
+    );
+  end loop;
+
+  -- 导入排班条目
+  for v_entry in select * from jsonb_array_elements(p_data->'entries')
+  loop
+    v_rider_id := v_entry->>'riderId';
+    v_rider_name := v_entry->>'riderName';
+    v_date := v_entry->>'date';
+    v_selections := v_entry->'selections';
+
+    -- 骑手 upsert
+    insert into public.riders (rider_id, name, group_id, group_name)
+    values (v_rider_id, v_rider_name, v_group_id, v_group_name)
+    on conflict (rider_id) do update set
+      name = v_rider_name,
+      group_id = v_group_id,
+      group_name = v_group_name;
+
+    -- 逐时段插入
+    v_all_zero := true;
+    for v_idx in 0 .. jsonb_array_length(v_selections) - 1
+    loop
+      if (v_selections->>v_idx)::int = 1 then
+        v_all_zero := false;
+        insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+        select v_rider_id, p_week_id, v_date::date, ts.id, true
+        from public.time_slots ts
+        where ts.week_id = p_week_id
+        order by ts.sort_order
+        limit 1 offset v_idx;
+      end if;
+    end loop;
+
+    -- 全0 => 排休
+    if v_all_zero then
+      insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+      values (v_rider_id, p_week_id, v_date::date, null, null)
+      on conflict (rider_id, work_date) where slot_id is null do nothing;
+    end if;
+  end loop;
+
+  return jsonb_build_object('success', true, 'message', '导入完成');
 end;
 $$;
 
--- 确保每日休息名额存在（返回上限）
+-- 清空某周所有排班（保留时段和骑手）
+create or replace function public.clear_week_schedules(p_week_id uuid)
+returns jsonb language plpgsql
+as $$
+begin
+  delete from public.rider_schedules where week_id = p_week_id;
+  return jsonb_build_object('success', true, 'message', '已清空');
+end;
+$$;
+
+-- 获取周的所有骑手（含排班统计）
+create or replace function public.get_week_riders(p_week_id uuid)
+returns jsonb language plpgsql
+as $$
+declare
+  v_result jsonb;
+begin
+  select jsonb_agg(jsonb_build_object(
+    'riderId', r.rider_id,
+    'name', r.name,
+    'groupId', r.group_id,
+    'groupName', r.group_name,
+    'minSlots', r.min_slots
+  ) order by r.name)
+  into v_result
+  from public.riders r
+  where exists (
+    select 1 from public.rider_schedules rs
+    where rs.rider_id = r.rider_id and rs.week_id = p_week_id
+  );
+  return coalesce(v_result, '[]'::jsonb);
+end;
+$$;
+
+-- 获取周的所有时段
+create or replace function public.get_week_slots(p_week_id uuid)
+returns jsonb language plpgsql
+as $$
+declare
+  v_result jsonb;
+begin
+  select jsonb_agg(jsonb_build_object(
+    'id', ts.id,
+    'name', ts.name,
+    'startTime', ts.start_time,
+    'endTime', ts.end_time,
+    'sortOrder', ts.sort_order,
+    'isSelectable', ts.is_selectable
+  ) order by ts.sort_order)
+  into v_result
+  from public.time_slots ts
+  where ts.week_id = p_week_id and ts.is_active = true;
+  return coalesce(v_result, '[]'::jsonb);
+end;
+$$;
+
+-- 管理员切换时段可选状态
+create or replace function public.toggle_slot_selectable(p_slot_id uuid)
+returns jsonb language plpgsql
+as $$
+declare
+  v_new boolean;
+begin
+  update public.time_slots
+  set is_selectable = not is_selectable
+  where id = p_slot_id
+  returning is_selectable into v_new;
+  return jsonb_build_object('success', true, 'isSelectable', v_new);
+end;
+$$;
+
+-- 管理员设置骑手最少时段数
+create or replace function public.set_rider_min_slots(p_rider_id text, p_min_slots int)
+returns jsonb language plpgsql
+as $$
+begin
+  update public.riders set min_slots = p_min_slots where rider_id = p_rider_id;
+  return jsonb_build_object('success', true);
+end;
+$$;
+
+-- 骑手切换时段出勤状态
+create or replace function public.toggle_rider_slot(
+  p_rider_id text,
+  p_week_id uuid,
+  p_work_date date,
+  p_slot_id uuid
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_current boolean;
+  v_slot_selectable boolean;
+begin
+  -- 检查时段是否可选
+  select is_selectable into v_slot_selectable
+  from public.time_slots where id = p_slot_id;
+
+  if not v_slot_selectable then
+    return jsonb_build_object('success', false, 'message', '该时段不可选');
+  end if;
+
+  -- 如果当天有排休记录，先删除
+  delete from public.rider_schedules
+  where rider_id = p_rider_id and work_date = p_work_date and slot_id is null;
+
+  -- 获取当前状态
+  select is_selected into v_current
+  from public.rider_schedules
+  where rider_id = p_rider_id and work_date = p_work_date and slot_id = p_slot_id;
+
+  if v_current is true then
+    -- 取消选择
+    delete from public.rider_schedules
+    where rider_id = p_rider_id and work_date = p_work_date and slot_id = p_slot_id;
+    return jsonb_build_object('success', true, 'selected', false);
+  else
+    -- 选择
+    insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+    values (p_rider_id, p_week_id, p_work_date, p_slot_id, true)
+    on conflict (rider_id, work_date, slot_id) where slot_id is not null
+    do update set is_selected = true;
+    return jsonb_build_object('success', true, 'selected', true);
+  end if;
+end;
+$$;
+
+-- 骑手设为排休
+create or replace function public.set_rider_rest(
+  p_rider_id text,
+  p_week_id uuid,
+  p_work_date date
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_limit integer;
+  v_used integer;
+begin
+  -- 检查排休名额
+  select max_slots into v_limit
+  from public.rest_day_limits
+  where week_start = (select start_date from public.schedule_weeks where id = p_week_id)
+    and rest_date = p_work_date;
+
+  if v_limit is null then
+    v_limit := 5;
+  end if;
+
+  select count(*) into v_used
+  from public.rider_schedules
+  where week_id = p_week_id and work_date = p_work_date and slot_id is null;
+
+  if v_used >= v_limit then
+    return jsonb_build_object('success', false, 'message', '该日期排休名额已满');
+  end if;
+
+  -- 删除该骑手当天的所有时段选择
+  delete from public.rider_schedules
+  where rider_id = p_rider_id and work_date = p_work_date and slot_id is not null;
+
+  -- 插入排休记录
+  insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+  values (p_rider_id, p_week_id, p_work_date, null, null)
+  on conflict (rider_id, work_date) where slot_id is null do nothing;
+
+  return jsonb_build_object('success', true, 'message', '已设为排休');
+end;
+$$;
+
+-- 取消排休
+create or replace function public.cancel_rider_rest(
+  p_rider_id text,
+  p_week_id uuid,
+  p_work_date date
+)
+returns jsonb language plpgsql
+as $$
+begin
+  delete from public.rider_schedules
+  where rider_id = p_rider_id and work_date = p_work_date and slot_id is null;
+  return jsonb_build_object('success', true);
+end;
+$$;
+
+-- 获取骑手某周数据
+create or replace function public.get_rider_week(
+  p_rider_id text,
+  p_week_id uuid
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_data jsonb;
+begin
+  select jsonb_agg(jsonb_build_object(
+    'workDate', rs.work_date,
+    'slotId', rs.slot_id,
+    'isSelected', rs.is_selected
+  ) order by rs.work_date, rs.slot_id)
+  into v_data
+  from public.rider_schedules rs
+  where rs.rider_id = p_rider_id and rs.week_id = p_week_id;
+  return coalesce(v_data, '[]'::jsonb);
+end;
+$$;
+
+-- 获取某周每日排休人数
+create or replace function public.get_week_rest_counts(p_week_id uuid)
+returns jsonb language plpgsql
+as $$
+declare
+  v_result jsonb;
+begin
+  select jsonb_object_agg(to_char(rs.work_date, 'YYYY-MM-DD'), cnt)
+  into v_result
+  from (
+    select work_date, count(*) as cnt
+    from public.rider_schedules
+    where week_id = p_week_id and slot_id is null
+    group by work_date
+  ) rs;
+  return coalesce(v_result, '{}'::jsonb);
+end;
+$$;
+
+-- 获取某周每时段选中人数
+create or replace function public.get_week_slot_counts(p_week_id uuid)
+returns jsonb language plpgsql
+as $$
+declare
+  v_result jsonb;
+begin
+  select jsonb_object_agg(to_char(rs.work_date, 'YYYY-MM-DD') || '-' || rs.slot_id::text, cnt)
+  into v_result
+  from (
+    select work_date, slot_id, count(*) as cnt
+    from public.rider_schedules
+    where week_id = p_week_id and slot_id is not null and is_selected = true
+    group by work_date, slot_id
+  ) rs;
+  return coalesce(v_result, '{}'::jsonb);
+end;
+$$;
+
+-- 确保每日排休名额存在（返回上限）
 create or replace function public.ensure_default_day_limit(p_week_start date, p_rest_date date)
 returns integer language plpgsql
 as $$
@@ -131,348 +475,79 @@ begin
 end;
 $$;
 
--- 解析名单：兼容新旧两种格式
--- 新格式：每行 "rider_id\tname"
--- 旧格式：空格分隔的姓名列表
-create or replace function public.parse_member_list(p_members text)
-returns table(rider_id text, name text) language plpgsql as $$
-begin
-  if position(E'\t' in p_members) > 0 then
-    return query
-    select
-      split_part(lines.line, E'\t', 1),
-      trim(substr(lines.line, position(E'\t' in lines.line) + 1))
-    from (
-      select unnest(string_to_array(p_members, E'\n')) as line
-    ) lines
-    where trim(lines.line) != '';
-  else
-    return query
-    select trim(elem), trim(elem)
-    from (select unnest(string_to_array(p_members, ' ')) as elem) elems
-    where trim(elem) != '';
-  end if;
-end;
-$$;
-
--- 初始化员工本周排班（仅首次调用时生效）
-create or replace function public.init_employee_week_shifts(
-  p_week_start date,
-  p_employee_name text,
-  p_rider_id text default ''
-)
-returns jsonb language plpgsql
-as $$
-declare
-  v_trimmed_name text;
-  v_trimmed_rider_id text;
-  v_end_date date;
-  v_week_id uuid;
-  v_valid boolean;
-  v_members text;
-begin
-  v_trimmed_name := trim(p_employee_name);
-  v_trimmed_rider_id := trim(p_rider_id);
-  if v_trimmed_name is null or char_length(v_trimmed_name) = 0 then
-    return jsonb_build_object('success', false, 'message', '员工姓名不能为空');
-  end if;
-  if v_trimmed_rider_id = '' then
-    v_trimmed_rider_id := v_trimmed_name;
-  end if;
-
-  select rw.end_date, rw.id into v_end_date, v_week_id
-  from public.rest_weeks rw where rw.start_date = p_week_start;
-
-  if v_end_date is null then
-    return jsonb_build_object('success', false, 'message', '当前排休周不存在');
-  end if;
-
-  select rm.members into v_members
-  from public.rest_week_members rm
-  join public.rest_weeks rw on rw.id = rm.week_id
-  where rw.start_date = p_week_start;
-
-  if v_members is null then
-    return jsonb_build_object('success', false, 'message', '当前周尚未设置人员名单');
-  end if;
-
-  select exists (
-    select 1 from public.parse_member_list(v_members) p
-    where p.rider_id = v_trimmed_rider_id and p.name = v_trimmed_name
-  ) into v_valid;
-
-  if not v_valid then
-    return jsonb_build_object('success', false, 'message', '"' || v_trimmed_name || '" 不在当前周的人员名单中');
-  end if;
-
-  if exists (
-    select 1 from public.employee_week_shifts
-    where week_start = p_week_start and rider_id = v_trimmed_rider_id
-  ) then
-    return jsonb_build_object('success', true, 'message', '已初始化');
-  end if;
-
-  insert into public.employee_week_shifts (week_start, work_date, employee_name, rider_id, period_id)
-  select p_week_start, dates.work_date, v_trimmed_name, v_trimmed_rider_id, p.id
-  from generate_series(p_week_start, v_end_date, interval '1 day') as dates(work_date)
-  cross join (
-    select id from public.rest_periods
-    where week_id = v_week_id and is_active = true
-    order by sort_order asc
-  ) p;
-
-  return jsonb_build_object('success', true, 'message', '已生成当前周班次');
-end;
-$$;
-
--- 切换时段选择（已选→取消，未选→新增，达上限→自动踢出最旧选择）
-create or replace function public.toggle_employee_period(
-  p_week_start date,
-  p_work_date date,
-  p_employee_name text,
-  p_period_id uuid,
-  p_rider_id text default ''
-)
-returns jsonb language plpgsql
-as $$
-declare
-  v_trimmed_name text;
-  v_trimmed_rider_id text;
-  v_week_id uuid;
-  v_enabled_count integer;
-  v_selected_count integer;
-  v_evicted_name text;
-  v_new_name text;
-  v_valid boolean;
-  v_members text;
-begin
-  v_trimmed_name := trim(p_employee_name);
-  v_trimmed_rider_id := trim(p_rider_id);
-  if v_trimmed_name is null or char_length(v_trimmed_name) = 0 then
-    return jsonb_build_object('success', false, 'message', '员工姓名不能为空');
-  end if;
-  if v_trimmed_rider_id = '' then
-    v_trimmed_rider_id := v_trimmed_name;
-  end if;
-
-  select rm.members into v_members
-  from public.rest_week_members rm
-  join public.rest_weeks rw on rw.id = rm.week_id
-  where rw.start_date = p_week_start;
-
-  if v_members is not null then
-    select exists (
-      select 1 from public.parse_member_list(v_members) p
-      where p.rider_id = v_trimmed_rider_id and p.name = v_trimmed_name
-    ) into v_valid;
-
-    if not v_valid then
-      return jsonb_build_object('success', false, 'message', '"' || v_trimmed_name || '" 不在当前周的人员名单中');
-    end if;
-  end if;
-
-  select id into v_week_id from public.rest_weeks where start_date = p_week_start;
-
-  select count(*) into v_enabled_count
-  from public.rest_periods where week_id = v_week_id and is_active = true;
-
-  if exists (
-    select 1 from public.employee_week_shifts
-    where week_start = p_week_start and work_date = p_work_date
-      and rider_id = v_trimmed_rider_id and period_id = p_period_id
-  ) then
-    return jsonb_build_object('success', true, 'message', '');
-  end if;
-
-  select count(*) into v_selected_count
-  from public.employee_week_shifts
-  where week_start = p_week_start and work_date = p_work_date
-    and rider_id = v_trimmed_rider_id and period_id is not null;
-
-  if v_selected_count >= v_enabled_count then
-    select p.name into v_evicted_name
-    from public.employee_week_shifts ews
-    join public.rest_periods p on p.id = ews.period_id
-    where ews.week_start = p_week_start
-      and ews.work_date = p_work_date
-      and ews.rider_id = v_trimmed_rider_id
-      and ews.period_id is not null
-    order by ews.created_at asc
-    limit 1;
-
-    delete from public.employee_week_shifts
-    where id = (
-      select id from public.employee_week_shifts
-      where week_start = p_week_start
-        and work_date = p_work_date
-        and rider_id = v_trimmed_rider_id
-        and period_id is not null
-      order by created_at asc
-      limit 1
-    );
-  end if;
-
-  select name into v_new_name from public.rest_periods where id = p_period_id;
-
-  delete from public.employee_week_shifts
-  where week_start = p_week_start and work_date = p_work_date
-    and rider_id = v_trimmed_rider_id and period_id is null;
-
-  insert into public.employee_week_shifts (week_start, work_date, employee_name, rider_id, period_id)
-  values (p_week_start, p_work_date, v_trimmed_name, v_trimmed_rider_id, p_period_id);
-
-  if v_evicted_name is not null then
-    return jsonb_build_object('success', true, 'message', '已选择' || v_new_name || '（已自动取消' || v_evicted_name || '）');
-  else
-    return jsonb_build_object('success', true, 'message', '已选择' || v_new_name);
-  end if;
-end;
-$$;
-
--- 设置休息
-create or replace function public.set_employee_rest(
-  p_week_start date,
-  p_work_date date,
-  p_employee_name text,
-  p_rider_id text default ''
-)
-returns jsonb language plpgsql
-as $$
-declare
-  v_trimmed_name text;
-  v_trimmed_rider_id text;
-  v_limit integer;
-  v_used integer;
-  v_valid boolean;
-  v_members text;
-begin
-  v_trimmed_name := trim(p_employee_name);
-  v_trimmed_rider_id := trim(p_rider_id);
-  if v_trimmed_name is null or char_length(v_trimmed_name) = 0 then
-    return jsonb_build_object('success', false, 'message', '员工姓名不能为空');
-  end if;
-  if v_trimmed_rider_id = '' then
-    v_trimmed_rider_id := v_trimmed_name;
-  end if;
-
-  select rm.members into v_members
-  from public.rest_week_members rm
-  join public.rest_weeks rw on rw.id = rm.week_id
-  where rw.start_date = p_week_start;
-
-  if v_members is not null then
-    select exists (
-      select 1 from public.parse_member_list(v_members) p
-      where p.rider_id = v_trimmed_rider_id and p.name = v_trimmed_name
-    ) into v_valid;
-
-    if not v_valid then
-      return jsonb_build_object('success', false, 'message', '"' || v_trimmed_name || '" 不在当前周的人员名单中');
-    end if;
-  end if;
-
-  v_limit := public.ensure_default_day_limit(p_week_start, p_work_date);
-
-  select count(*) into v_used
-  from public.employee_week_shifts
-  where week_start = p_week_start and work_date = p_work_date and period_id is null;
-
-  if v_used >= v_limit then
-    return jsonb_build_object('success', false, 'message', '该日期排休名额已满');
-  end if;
-
-  delete from public.employee_week_shifts
-  where week_start = p_week_start and work_date = p_work_date
-    and rider_id = v_trimmed_rider_id and period_id is not null;
-
-  insert into public.employee_week_shifts (week_start, work_date, employee_name, rider_id, period_id)
-  values (p_week_start, p_work_date, v_trimmed_name, v_trimmed_rider_id, null)
-  on conflict (rider_id, work_date) where period_id is null do nothing;
-
-  return jsonb_build_object('success', true, 'message', '已设为排休');
-end;
-$$;
-
--- 克隆周时段（管理员新建周时使用）
-create or replace function public.clone_week_periods(
+-- 克隆周时段
+create or replace function public.clone_week_slots(
   p_source_week_id uuid,
   p_target_week_id uuid
 )
 returns void language plpgsql
 as $$
 begin
-  insert into public.rest_periods (name, start_time, end_time, sort_order, is_active, week_id)
-  select name, start_time, end_time, sort_order, is_active, p_target_week_id
-  from public.rest_periods
+  insert into public.time_slots (week_id, name, start_time, end_time, sort_order, is_selectable, is_active)
+  select p_target_week_id, name, start_time, end_time, sort_order, is_selectable, is_active
+  from public.time_slots
   where week_id = p_source_week_id;
 end;
 $$;
 
 -- ==================== 6. 触发器 ====================
 
-create trigger trg_rest_periods_updated_at before update on public.rest_periods
+create trigger trg_sw_updated_at before update on public.schedule_weeks
   for each row execute function public.set_updated_at();
-create trigger trg_rest_weeks_updated_at before update on public.rest_weeks
+create trigger trg_ts_updated_at before update on public.time_slots
   for each row execute function public.set_updated_at();
-create trigger trg_rest_day_limits_updated_at before update on public.rest_day_limits
+create trigger trg_rdl_updated_at before update on public.rest_day_limits
   for each row execute function public.set_updated_at();
-create trigger trg_employee_week_shifts_updated_at before update on public.employee_week_shifts
+create trigger trg_rs_updated_at before update on public.rider_schedules
   for each row execute function public.set_updated_at();
-create trigger trg_rest_week_members_updated_at before update on public.rest_week_members
-  for each row execute function public.set_updated_at();
-create trigger trg_rest_weeks_delete_related before delete on public.rest_weeks
-  for each row execute function public.delete_related_week_data();
 
 -- ==================== 7. RLS ====================
 
-alter table public.rest_periods enable row level security;
-alter table public.rest_weeks enable row level security;
+alter table public.schedule_weeks enable row level security;
+alter table public.time_slots enable row level security;
+alter table public.riders enable row level security;
 alter table public.rest_day_limits enable row level security;
-alter table public.employee_week_shifts enable row level security;
-alter table public.rest_week_members enable row level security;
+alter table public.rider_schedules enable row level security;
 
-create policy "public read" on public.rest_periods for select to anon, authenticated using (true);
-create policy "public write" on public.rest_periods for all to anon, authenticated using (true) with check (true);
-create policy "public read" on public.rest_weeks for select to anon, authenticated using (true);
-create policy "public write" on public.rest_weeks for all to anon, authenticated using (true) with check (true);
+create policy "public read" on public.schedule_weeks for select to anon, authenticated using (true);
+create policy "public write" on public.schedule_weeks for all to anon, authenticated using (true) with check (true);
+create policy "public read" on public.time_slots for select to anon, authenticated using (true);
+create policy "public write" on public.time_slots for all to anon, authenticated using (true) with check (true);
+create policy "public read" on public.riders for select to anon, authenticated using (true);
+create policy "public write" on public.riders for all to anon, authenticated using (true) with check (true);
 create policy "public read" on public.rest_day_limits for select to anon, authenticated using (true);
 create policy "public write" on public.rest_day_limits for all to anon, authenticated using (true) with check (true);
-create policy "public read" on public.employee_week_shifts for select to anon, authenticated using (true);
-create policy "public write" on public.employee_week_shifts for all to anon, authenticated using (true) with check (true);
-create policy "public read" on public.rest_week_members for select to anon, authenticated using (true);
-create policy "public write" on public.rest_week_members for all to anon, authenticated using (true) with check (true);
+create policy "public read" on public.rider_schedules for select to anon, authenticated using (true);
+create policy "public write" on public.rider_schedules for all to anon, authenticated using (true) with check (true);
 
 -- ==================== 8. 权限 ====================
 
 grant usage on schema public to anon, authenticated;
-grant all on public.rest_periods to anon, authenticated;
-grant all on public.rest_weeks to anon, authenticated;
+grant all on public.schedule_weeks to anon, authenticated;
+grant all on public.time_slots to anon, authenticated;
+grant all on public.riders to anon, authenticated;
 grant all on public.rest_day_limits to anon, authenticated;
-grant all on public.employee_week_shifts to anon, authenticated;
-grant all on public.rest_week_members to anon, authenticated;
-grant execute on function public.ensure_default_day_limit(date, date) to anon, authenticated;
-grant execute on function public.init_employee_week_shifts(date, text, text) to anon, authenticated;
-grant execute on function public.toggle_employee_period(date, date, text, uuid, text) to anon, authenticated;
-grant execute on function public.set_employee_rest(date, date, text, text) to anon, authenticated;
-grant execute on function public.clone_week_periods(uuid, uuid) to anon, authenticated;
-grant execute on function public.parse_member_list(text) to anon, authenticated;
+grant all on public.rider_schedules to anon, authenticated;
+
+grant execute on function public.import_xls_week to anon, authenticated;
+grant execute on function public.clear_week_schedules to anon, authenticated;
+grant execute on function public.get_week_riders to anon, authenticated;
+grant execute on function public.get_week_slots to anon, authenticated;
+grant execute on function public.toggle_slot_selectable to anon, authenticated;
+grant execute on function public.set_rider_min_slots to anon, authenticated;
+grant execute on function public.toggle_rider_slot to anon, authenticated;
+grant execute on function public.set_rider_rest to anon, authenticated;
+grant execute on function public.cancel_rider_rest to anon, authenticated;
+grant execute on function public.get_rider_week to anon, authenticated;
+grant execute on function public.get_week_rest_counts to anon, authenticated;
+grant execute on function public.get_week_slot_counts to anon, authenticated;
+grant execute on function public.ensure_default_day_limit to anon, authenticated;
+grant execute on function public.clone_week_slots to anon, authenticated;
 
 -- ==================== 9. Realtime ====================
 
-alter publication supabase_realtime add table public.rest_periods;
-alter publication supabase_realtime add table public.rest_weeks;
+alter publication supabase_realtime add table public.schedule_weeks;
+alter publication supabase_realtime add table public.time_slots;
+alter publication supabase_realtime add table public.riders;
 alter publication supabase_realtime add table public.rest_day_limits;
-alter publication supabase_realtime add table public.employee_week_shifts;
-alter publication supabase_realtime add table public.rest_week_members;
-
--- ==================== 10. 种子数据 ====================
-
-insert into public.rest_weeks (start_date, end_date, is_active)
-values ('2026-05-25'::date, '2026-05-31'::date, true);
-
-insert into public.rest_periods (name, start_time, end_time, sort_order, is_active, week_id)
-select '午高峰', '10:30:00'::time, '13:30:00'::time, 1, true, w.id
-from public.rest_weeks w where w.start_date = '2026-05-25'::date
-union all
-select '晚高峰', '18:00:00'::time, '20:00:00'::time, 2, true, w.id
-from public.rest_weeks w where w.start_date = '2026-05-25'::date;
+alter publication supabase_realtime add table public.rider_schedules;

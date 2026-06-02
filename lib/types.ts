@@ -33,6 +33,7 @@ export type EmployeeWeekShiftRow = {
   week_start: string;
   work_date: string;
   employee_name: string;
+  rider_id: string;
   period_id: string | null;
   created_at: string;
   updated_at: string;

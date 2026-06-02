@@ -13,6 +13,16 @@ function getDefaultLimit(date: string) {
   return day === 0 || day === 6 ? DEFAULT_WEEKEND_LIMIT : DEFAULT_WEEKDAY_LIMIT;
 }
 
+function parseMemberEntries(text: string): Array<{ riderId: string; name: string }> {
+  if (text.includes("\t")) {
+    return text.split("\n").filter(Boolean).map((line) => {
+      const idx = line.indexOf("\t");
+      return { riderId: line.slice(0, idx).trim(), name: line.slice(idx + 1).trim() };
+    });
+  }
+  return text.split(/\s+/).filter(Boolean).map((name) => ({ riderId: name, name }));
+}
+
 function formatPeriodLabel(period: RestPeriodRow) {
   return `${period.name} ${period.start_time.slice(0, 5)}-${period.end_time.slice(0, 5)}`;
 }
@@ -44,7 +54,7 @@ export default function AdminPage() {
   const [limits, setLimits] = useState<Record<string, number>>({});
   const [shifts, setShifts] = useState<EmployeeWeekShiftRow[]>([]);
   const [periods, setPeriods] = useState<RestPeriodRow[]>([]);
-  const [savingDate, setSavingDate] = useState<string | null>(null);
+  const [savingAll, setSavingAll] = useState(false);
   const [savingPeriodId, setSavingPeriodId] = useState<string | null>(null);
   const [savingWeekId, setSavingWeekId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -68,26 +78,28 @@ export default function AdminPage() {
     [periods],
   );
 
-  const memberNames = useMemo(() => {
+  const memberEntries = useMemo(() => {
     if (!activeWeek || !weekMembers[activeWeek.id]) return [];
-    return weekMembers[activeWeek.id].split(/\s+/).filter(Boolean);
+    return parseMemberEntries(weekMembers[activeWeek.id]);
   }, [activeWeek, weekMembers]);
+
+  const memberNames = useMemo(() => memberEntries.map((e) => e.name), [memberEntries]);
 
   const namesWithShifts = useMemo(() => new Set(shifts.map((s) => s.employee_name)), [shifts]);
 
   const requestSummaries = useMemo(() => {
-    const grouped = new Map<string, EmployeeWeekShiftRow[]>();
+    const grouped = new Map<string, { riderId: string; shifts: EmployeeWeekShiftRow[] }>();
 
     for (const shift of shifts) {
       const key = shift.employee_name;
-      const list = grouped.get(key) ?? [];
-      list.push(shift);
-      grouped.set(key, list);
+      const entry = grouped.get(key) ?? { riderId: shift.rider_id, shifts: [] };
+      entry.shifts.push(shift);
+      grouped.set(key, entry);
     }
 
     return Array.from(grouped.entries())
       .sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))
-      .map(([employeeName, employeeShifts]) => {
+      .map(([employeeName, { riderId, shifts: employeeShifts }]) => {
         const shiftsByDate = new Map<string, EmployeeWeekShiftRow[]>();
         for (const shift of employeeShifts) {
           const list = shiftsByDate.get(shift.work_date) ?? [];
@@ -114,6 +126,7 @@ export default function AdminPage() {
 
         return {
           employeeName,
+          riderId,
           dayTexts: weekSummary,
         };
       });
@@ -155,7 +168,7 @@ export default function AdminPage() {
     async function loadWeekData() {
       const [limitsResponse, shiftsResponse] = await Promise.all([
         supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", weekStart),
-        supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,period_id,created_at,updated_at").eq("week_start", weekStart).order("employee_name", { ascending: true }).order("work_date", { ascending: true }),
+        supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,rider_id,period_id,created_at,updated_at").eq("week_start", weekStart).order("employee_name", { ascending: true }).order("work_date", { ascending: true }),
       ]);
       const nextLimits = (limitsResponse.data ?? []).reduce<Record<string, number>>((acc, row) => {
         acc[row.rest_date] = row.max_slots;
@@ -195,7 +208,7 @@ export default function AdminPage() {
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "employee_week_shifts", filter: activeWeek ? `week_start=eq.${activeWeek.start_date}` : undefined }, async () => {
         if (!activeWeek) return;
-        const { data } = await supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,period_id,created_at,updated_at").eq("week_start", activeWeek.start_date).order("employee_name", { ascending: true }).order("work_date", { ascending: true });
+        const { data } = await supabase.from("employee_week_shifts").select("id,week_start,work_date,employee_name,rider_id,period_id,created_at,updated_at").eq("week_start", activeWeek.start_date).order("employee_name", { ascending: true }).order("work_date", { ascending: true });
         setShifts(data ?? []);
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "rest_week_members" }, async () => {
@@ -354,23 +367,25 @@ export default function AdminPage() {
     setMessage("时段已删除。");
   }
 
-  async function saveLimit(restDate: string) {
+  async function saveAllLimits() {
     if (!activeWeek) return;
-    setSavingDate(restDate);
+    setSavingAll(true);
     setMessage(null);
 
-    const maxSlots = limits[restDate] ?? getDefaultLimit(restDate);
-    const { error } = await supabase.from("rest_day_limits").upsert(
-      { week_start: activeWeek.start_date, rest_date: restDate, max_slots: maxSlots },
-      { onConflict: "week_start,rest_date" },
-    );
-    setSavingDate(null);
+    const rows = weekDays.map((day) => ({
+      week_start: activeWeek.start_date,
+      rest_date: day.key,
+      max_slots: limits[day.key] ?? getDefaultLimit(day.key),
+    }));
+
+    const { error } = await supabase.from("rest_day_limits").upsert(rows, { onConflict: "week_start,rest_date" });
+    setSavingAll(false);
 
     if (error) {
       setMessage(error.message);
       return;
     }
-    setMessage(`已保存 ${restDate} 的名额。`);
+    setMessage("每日名额已统一保存。");
   }
 
   // 自动消除消息的副作用
@@ -423,13 +438,13 @@ export default function AdminPage() {
               {/* 周名单 */}
               {editingMemberWeekId === week.id ? (
                 <div className="member-editor">
-                  <label style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-muted)" }}>本周人员名单（以空格分隔）</label>
+                  <label style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-muted)" }}>骑手ID和姓名（每行一个，Tab 分隔）</label>
                   <textarea
                     className="member-textarea"
-                    rows={3}
+                    rows={5}
                     value={draftMemberText}
                     onChange={(event) => setDraftMemberText(event.target.value)}
-                    placeholder="张三 李四 王五"
+                    placeholder={"36355493\t卢文秀\n36517684\t张建国"}
                   />
                   <div className="card-actions-row">
                     <button className="btn-ghost btn-sm" type="button" onClick={() => setEditingMemberWeekId(null)}>
@@ -441,7 +456,7 @@ export default function AdminPage() {
                 <div className="member-summary">
                   <span className="member-count">
                     {weekMembers[week.id]
-                      ? `${weekMembers[week.id].split(/\s+/).filter(Boolean).length} 人`
+                      ? `${parseMemberEntries(weekMembers[week.id]).length} 人`
                       : "未设置名单"}
                   </span>
                   <button className="btn-ghost btn-sm" type="button" onClick={() => {
@@ -539,11 +554,11 @@ export default function AdminPage() {
         {activeWeek && weekMembers[activeWeek.id] ? (
           <>
             <div className="member-tags">
-              {(showPendingOnly ? memberNames.filter((n) => !namesWithShifts.has(n)) : memberNames).map((name) => {
-                const hasShifts = namesWithShifts.has(name);
+              {(showPendingOnly ? memberEntries.filter((e) => !namesWithShifts.has(e.name)) : memberEntries).map((entry) => {
+                const hasShifts = namesWithShifts.has(entry.name);
                 return (
-                  <span key={name} className={`member-tag ${hasShifts ? "" : "member-tag-pending"}`}>
-                    {name}
+                  <span key={entry.riderId} className={`member-tag ${hasShifts ? "" : "member-tag-pending"}`}>
+                    {entry.name} <span style={{ fontSize: "11px", opacity: 0.6 }}>{entry.riderId}</span>
                   </span>
                 );
               })}
@@ -562,7 +577,7 @@ export default function AdminPage() {
             <table className="admin-table">
               <thead>
                 <tr>
-                  <th>员工姓名 ({requestSummaries.length}人)</th>
+                  <th>员工 ({requestSummaries.length}人)</th>
                   {weekDays.map(day => (
                     <th key={day.key}>{day.weekdayLabel} <br/><span style={{fontSize: "12px", fontWeight: "normal"}}>{day.shortDate}</span></th>
                   ))}
@@ -571,7 +586,7 @@ export default function AdminPage() {
               <tbody>
                 {requestSummaries.map((item) => (
                   <tr key={item.employeeName}>
-                    <td>{item.employeeName}</td>
+                    <td>{item.employeeName} <span style={{fontSize: "11px", color: "var(--text-muted)"}}>{item.riderId}</span></td>
                     {item.dayTexts.map((text, i) => {
                       const stateText = text.substring(text.indexOf(" ") + 1);
                       let badgeClass = "work";
@@ -598,7 +613,7 @@ export default function AdminPage() {
         <div className="section-header">
           <div>
             <h2>每日休息名额配额</h2>
-            <p>控制本周各天允许的最多休息人数</p>
+            <p>控制本周各天允许的最多休息人数 · 排班率 = (总人数 − 已排休人数) / 总人数</p>
           </div>
         </div>
 
@@ -606,22 +621,27 @@ export default function AdminPage() {
           {weekDays.map((day) => {
             const usedSlots = shifts.filter((item) => item.work_date === day.key && item.period_id === null).length;
             const maxSlots = limits[day.key] ?? getDefaultLimit(day.key);
+            const memberCount = memberNames.length;
+            const ratio = memberCount > 0 ? ((memberCount - usedSlots) / memberCount * 100).toFixed(0) + "%" : "-";
 
             return (
               <div className="config-card" key={day.key} style={{ flexDirection: "row", alignItems: "center" }}>
                 <div style={{ flex: 1 }}>
                   <strong style={{ display: "block", fontSize: "16px" }}>{day.weekdayLabel}</strong>
-                  <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>{day.shortDate} · 已用 {usedSlots} 人</span>
+                  <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>{day.shortDate} · 已用 {usedSlots} 人 · 总 {memberCount}人 · 排班率 {ratio}</span>
                 </div>
                 <div style={{ width: "80px" }}>
                   <input className="clean-input" type="number" min={0} max={20} value={maxSlots} onChange={(event) => setLimits((current) => ({ ...current, [day.key]: Number(event.target.value) }))} style={{ padding: "8px", textAlign: "center" }} />
                 </div>
-                <button className="btn-primary btn-sm" type="button" disabled={savingDate === day.key} onClick={() => saveLimit(day.key)} style={{ whiteSpace: "nowrap" }}>
-                  保存
-                </button>
               </div>
             );
           })}
+        </div>
+
+        <div style={{ marginTop: "20px", display: "flex", justifyContent: "flex-end" }}>
+          <button className="btn-primary" type="button" disabled={savingAll} onClick={saveAllLimits}>
+            {savingAll ? "保存中..." : "保存"}
+          </button>
         </div>
       </section>
 

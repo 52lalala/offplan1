@@ -20,11 +20,36 @@ type DayCard = {
 
 const DEFAULT_WEEKDAY_LIMIT = 5;
 const DEFAULT_WEEKEND_LIMIT = 2;
-const STORAGE_KEY = "offplan.employeeName";
+const STORAGE_KEY = "offplan.employeeInfo";
 
 function getDefaultLimit(date: string) {
   const day = new Date(`${date}T00:00:00`).getDay();
   return day === 0 || day === 6 ? DEFAULT_WEEKEND_LIMIT : DEFAULT_WEEKDAY_LIMIT;
+}
+
+function loadStoredEmployeeInfo(): { name: string; riderId: string } | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.name === "string" && typeof parsed.riderId === "string") {
+      return parsed;
+    }
+    return null;
+  } catch {
+    const legacy = window.localStorage.getItem(STORAGE_KEY)?.trim();
+    return legacy ? { name: legacy, riderId: legacy } : null;
+  }
+}
+
+function parseMemberList(text: string): Array<{ riderId: string; name: string }> {
+  if (text.includes("\t")) {
+    return text.split("\n").filter(Boolean).map((line) => {
+      const idx = line.indexOf("\t");
+      return { riderId: line.slice(0, idx).trim(), name: line.slice(idx + 1).trim() };
+    });
+  }
+  return text.split(/\s+/).filter(Boolean).map((name) => ({ riderId: name, name }));
 }
 
 export default function WeekSchedulePage() {
@@ -34,7 +59,9 @@ export default function WeekSchedulePage() {
   const [week, setWeek] = useState<RestWeekRow | null>(null);
   const [weekLoading, setWeekLoading] = useState(true);
   const [employeeName, setEmployeeName] = useState("");
+  const [employeeRiderId, setEmployeeRiderId] = useState("");
   const [draftName, setDraftName] = useState("");
+  const [draftRiderId, setDraftRiderId] = useState("");
   const [dayLimits, setDayLimits] = useState<Record<string, number>>({});
   const [shifts, setShifts] = useState<EmployeeWeekShiftRow[]>([]);
   const [periods, setPeriods] = useState<RestPeriodRow[]>([]);
@@ -43,7 +70,7 @@ export default function WeekSchedulePage() {
   const [message, setMessage] = useState<string | null>(null);
   const [showNameGate, setShowNameGate] = useState(false);
   const [pendingRestDay, setPendingRestDay] = useState<DayCard | null>(null);
-  const [activeWeekMembers, setActiveWeekMembers] = useState<string[] | null>(null);
+  const [activeWeekMembers, setActiveWeekMembers] = useState<Array<{ riderId: string; name: string }> | null>(null);
   const [allRestCounts, setAllRestCounts] = useState<Record<string, number>>({});
   const [shiftsLoaded, setShiftsLoaded] = useState(false);
 
@@ -105,10 +132,12 @@ export default function WeekSchedulePage() {
   }, [weekId]);
 
   useEffect(() => {
-    const storedName = window.localStorage.getItem(STORAGE_KEY)?.trim() ?? "";
-    if (storedName) {
-      setEmployeeName(storedName);
-      setDraftName(storedName);
+    const stored = loadStoredEmployeeInfo();
+    if (stored) {
+      setEmployeeName(stored.name);
+      setEmployeeRiderId(stored.riderId);
+      setDraftName(stored.name);
+      setDraftRiderId(stored.riderId);
     } else {
       setShowNameGate(true);
     }
@@ -133,20 +162,27 @@ export default function WeekSchedulePage() {
         .eq("week_id", currentWeek.id)
         .maybeSingle();
       if (data?.members?.trim()) {
-        const members = data.members.split(/\s+/).filter(Boolean);
-        setActiveWeekMembers(members);
-        const storedName = window.localStorage.getItem(STORAGE_KEY)?.trim() ?? "";
-        if (storedName && !members.includes(storedName)) {
-          setEmployeeName("");
-          setDraftName("");
-          setShowNameGate(true);
+        const entries = parseMemberList(data.members);
+        setActiveWeekMembers(entries);
+        const stored = loadStoredEmployeeInfo();
+        if (stored) {
+          const match = entries.find((e) => e.riderId === stored.riderId && e.name === stored.name);
+          if (!match) {
+            setEmployeeName("");
+            setEmployeeRiderId("");
+            setDraftName("");
+            setDraftRiderId("");
+            setShowNameGate(true);
+          }
         }
       } else {
         setActiveWeekMembers(null);
-        const storedName = window.localStorage.getItem(STORAGE_KEY)?.trim() ?? "";
-        if (storedName) {
+        const stored = loadStoredEmployeeInfo();
+        if (stored) {
           setEmployeeName("");
+          setEmployeeRiderId("");
           setDraftName("");
+          setDraftRiderId("");
           setShowNameGate(true);
         }
       }
@@ -161,18 +197,22 @@ export default function WeekSchedulePage() {
         return;
       }
 
+      const stored = loadStoredEmployeeInfo();
+      const riderId = stored?.riderId ?? employeeName.trim();
+
       await supabase.rpc("init_employee_week_shifts", {
         p_week_start: week.start_date,
         p_employee_name: employeeName.trim(),
+        p_rider_id: riderId,
       });
 
       const [limitsResponse, shiftsResponse, restCountsResponse] = await Promise.all([
         supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", week.start_date),
         supabase
           .from("employee_week_shifts")
-          .select("id,week_start,work_date,employee_name,period_id,created_at,updated_at")
+          .select("id,week_start,work_date,employee_name,rider_id,period_id,created_at,updated_at")
           .eq("week_start", week.start_date)
-          .eq("employee_name", employeeName.trim())
+          .eq("rider_id", riderId)
           .order("work_date", { ascending: true }),
         supabase
           .from("employee_week_shifts")
@@ -216,12 +256,15 @@ export default function WeekSchedulePage() {
         async (_payload: RealtimePostgresChangesPayload<EmployeeWeekShiftRow>) => {
           if (!week || !employeeName.trim()) return;
 
+          const stored = loadStoredEmployeeInfo();
+          const riderId = stored?.riderId ?? employeeName.trim();
+
           const [shiftsResponse, restCountsResponse] = await Promise.all([
             supabase
               .from("employee_week_shifts")
-              .select("id,week_start,work_date,employee_name,period_id,created_at,updated_at")
+              .select("id,week_start,work_date,employee_name,rider_id,period_id,created_at,updated_at")
               .eq("week_start", week.start_date)
-              .eq("employee_name", employeeName.trim())
+              .eq("rider_id", riderId)
               .order("work_date", { ascending: true }),
             supabase
               .from("employee_week_shifts")
@@ -278,7 +321,7 @@ export default function WeekSchedulePage() {
             .eq("week_id", week.id)
             .maybeSingle();
           if (data?.members?.trim()) {
-            setActiveWeekMembers(data.members.split(/\s+/).filter(Boolean));
+            setActiveWeekMembers(parseMemberList(data.members));
           } else {
             setActiveWeekMembers(null);
           }
@@ -300,6 +343,7 @@ export default function WeekSchedulePage() {
     const { data, error } = await supabase.rpc("init_employee_week_shifts", {
       p_week_start: week.start_date,
       p_employee_name: nextName,
+      p_rider_id: draftRiderId.trim() || nextName,
     });
 
     if (error) {
@@ -317,13 +361,19 @@ export default function WeekSchedulePage() {
 
   async function saveEmployeeName() {
     const trimmedName = draftName.trim();
+    const trimmedRiderId = draftRiderId.trim();
     if (!trimmedName) {
       setMessage("请先填写姓名。");
       return;
     }
 
-    if (activeWeekMembers === null || !activeWeekMembers.includes(trimmedName)) {
-      setMessage(activeWeekMembers === null ? "当前周尚未设置人员名单，请联系管理员。" : `"${trimmedName}" 不在当前周的人员名单中，请联系管理员。`);
+    if (activeWeekMembers === null) {
+      setMessage("当前周尚未设置人员名单，请联系管理员。");
+      return;
+    }
+
+    if (!activeWeekMembers.some((e) => e.name === trimmedName)) {
+      setMessage(`"${trimmedName}" 不在当前周的人员名单中，请联系管理员。`);
       return;
     }
 
@@ -333,9 +383,12 @@ export default function WeekSchedulePage() {
 
     if (!initialized) return;
 
-    window.localStorage.setItem(STORAGE_KEY, trimmedName);
+    const info = JSON.stringify({ name: trimmedName, riderId: trimmedRiderId });
+    window.localStorage.setItem(STORAGE_KEY, info);
     setEmployeeName(trimmedName);
+    setEmployeeRiderId(trimmedRiderId);
     setDraftName(trimmedName);
+    setDraftRiderId(trimmedRiderId);
     setShowNameGate(false);
     setMessage(`欢迎，${trimmedName}`);
   }
@@ -357,10 +410,12 @@ export default function WeekSchedulePage() {
     setSubmittingKey(pendingRestDay.date);
     setMessage(null);
 
+    const riderId = employeeRiderId || employeeName.trim();
     const { data, error } = await supabase.rpc("set_employee_rest", {
       p_week_start: week.start_date,
       p_work_date: pendingRestDay.date,
       p_employee_name: employeeName.trim(),
+      p_rider_id: riderId,
     });
 
     setSubmittingKey(null);
@@ -380,11 +435,12 @@ export default function WeekSchedulePage() {
       setShifts([]);
       return;
     }
+    const riderId = employeeRiderId || employeeName.trim();
     const { data } = await supabase
       .from("employee_week_shifts")
-      .select("id,week_start,work_date,employee_name,period_id,created_at,updated_at")
+      .select("id,week_start,work_date,employee_name,rider_id,period_id,created_at,updated_at")
       .eq("week_start", week.start_date)
-      .eq("employee_name", employeeName.trim())
+      .eq("rider_id", riderId)
       .order("work_date", { ascending: true });
     setShifts(data ?? []);
   }
@@ -401,13 +457,15 @@ export default function WeekSchedulePage() {
     setTogglingPeriods((prev) => ({ ...prev, [key]: true }));
     setMessage(null);
 
+    const riderId = employeeRiderId || employeeName.trim();
+
     // Optimistic: 立即翻转选中状态
     setShifts((prev) => {
       const exists = prev.find((s) => s.work_date === workDate && s.period_id === periodId);
       if (exists) {
         return prev.filter((s) => s !== exists);
       }
-      const dummy = { id: "opt-" + periodId, week_start: week.start_date, work_date: workDate, employee_name: employeeName.trim(), period_id: periodId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+      const dummy: EmployeeWeekShiftRow = { id: "opt-" + periodId, week_start: week.start_date, work_date: workDate, employee_name: employeeName.trim(), rider_id: riderId, period_id: periodId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
       return [...prev.filter((s) => s.work_date !== workDate || s.period_id === null), dummy];
     });
 
@@ -416,6 +474,7 @@ export default function WeekSchedulePage() {
       p_work_date: workDate,
       p_employee_name: employeeName.trim(),
       p_period_id: periodId,
+      p_rider_id: riderId,
     });
 
     if (error) {
@@ -489,14 +548,21 @@ export default function WeekSchedulePage() {
       {showNameGate ? (
         <div className="welcome-overlay">
           <section className="welcome-card">
-            <h2>填写姓名</h2>
-            <p>请填写真实姓名后进入排休页面，系统会自动生成当前周默认班次。</p>
-            <div className="input-group">
+            <h2>填写信息</h2>
+            <p>请填写骑手ID和真实姓名后进入排休页面，系统会自动生成当前周默认排班。</p>
+            <div className="input-group" style={{ gap: "12px" }}>
+              <input
+                className="clean-input"
+                value={draftRiderId}
+                onChange={(event) => setDraftRiderId(event.target.value)}
+                placeholder="骑手ID"
+                maxLength={30}
+              />
               <input
                 className="clean-input"
                 value={draftName}
                 onChange={(event) => setDraftName(event.target.value)}
-                placeholder="例如：张三"
+                placeholder="姓名"
                 maxLength={20}
               />
               <button

@@ -87,8 +87,15 @@ export default function WeekSchedulePage() {
         supabase.from("schedule_weeks").select("*").eq("id", weekId).maybeSingle(),
         supabase.from("time_slots").select("*").eq("week_id", weekId).order("sort_order"),
       ]);
-      setWeek(weekRes.data ?? null);
-      setAllSlots(slotsRes.data ?? []);
+      const weekData = weekRes.data ?? null;
+      if (weekData && !weekData.is_active) {
+        setMessage("该排休周尚未发布，请联系管理员");
+        setWeek(null);
+        setAllSlots([]);
+      } else {
+        setWeek(weekData);
+        setAllSlots(slotsRes.data ?? []);
+      }
       setWeekLoading(false);
     }
     void loadWeek();
@@ -150,22 +157,27 @@ export default function WeekSchedulePage() {
     void load();
   }, [week, rider]);
 
+  async function refreshRiderSchedules() {
+    if (!week || !rider?.rider_id) return;
+    const [schedRes, restCountsRes] = await Promise.all([
+      supabase.from("rider_schedules").select("*").eq("week_id", week.id).eq("rider_id", rider.rider_id),
+      supabase.from("rider_schedules").select("work_date").eq("week_id", week.id).is("slot_id", null),
+    ]);
+    setSchedules(schedRes.data ?? []);
+    const counts: Record<string, number> = {};
+    for (const r of restCountsRes.data ?? []) {
+      counts[r.work_date] = (counts[r.work_date] ?? 0) + 1;
+    }
+    setAllRestCounts(counts);
+    setSchedulesLoaded(true);
+  }
+
   useEffect(() => {
     const channel = supabase
       .channel(`week-sync-${week?.id ?? "no-week"}-${rider?.rider_id ?? "anon"}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "rider_schedules", filter: week ? `week_id=eq.${week.id}` : undefined },
         async () => {
-          if (!week || !rider?.rider_id) return;
-          const [schedRes, restCountsRes] = await Promise.all([
-            supabase.from("rider_schedules").select("*").eq("week_id", week.id).eq("rider_id", rider.rider_id),
-            supabase.from("rider_schedules").select("work_date").eq("week_id", week.id).is("slot_id", null),
-          ]);
-          setSchedules(schedRes.data ?? []);
-          const counts: Record<string, number> = {};
-          for (const r of restCountsRes.data ?? []) {
-            counts[r.work_date] = (counts[r.work_date] ?? 0) + 1;
-          }
-          setAllRestCounts(counts);
+          await refreshRiderSchedules();
         })
       .on("postgres_changes", { event: "*", schema: "public", table: "time_slots" }, async () => {
         if (!week) return;
@@ -180,8 +192,8 @@ export default function WeekSchedulePage() {
         })
       .on("postgres_changes", { event: "*", schema: "public", table: "riders", filter: rider ? `rider_id=eq.${rider.rider_id}` : undefined },
         async () => {
-          if (!rider?.rider_id) return;
-          const { data } = await supabase.from("riders").select("*").eq("rider_id", rider.rider_id).maybeSingle();
+          if (!rider?.rider_id || !week) return;
+          const { data } = await supabase.from("riders").select("*").eq("rider_id", rider.rider_id).eq("week_id", week.id).maybeSingle();
           if (data) setRider(data);
         })
       .subscribe();
@@ -195,10 +207,10 @@ export default function WeekSchedulePage() {
     setSubmittingKey("init");
     setMessage(null);
 
-    const { data } = await supabase.from("riders").select("*").ilike("name", trimmed).maybeSingle();
+    const { data } = await supabase.from("riders").select("*").eq("week_id", weekId).ilike("name", trimmed).maybeSingle();
 
     if (!data) {
-      setMessage(`"${trimmed}" 不在当前骑手名单中，请联系管理员。`);
+      setMessage(`"${trimmed}" 不在当前排休周的骑手名单中，请联系管理员。`);
       setSubmittingKey(null);
       return;
     }
@@ -212,20 +224,48 @@ export default function WeekSchedulePage() {
 
   async function handleToggleSlot(workDate: string, slotId: string) {
     if (!week || !rider) return;
-    const key = `${workDate}-${slotId}`;
-    if (submittingKey === key) return;
-    
-    // Check if trying to select more than required slots
-    const daySchedule = schedules.filter((s) => s.work_date === workDate);
-    const currentSelected = daySchedule.filter((s) => s.is_selected === true && s.slot_id !== null).map((s) => s.slot_id!);
-    const isAlreadySelected = currentSelected.includes(slotId);
-    
-    if (!isAlreadySelected && requiredSlots > 0 && currentSelected.length >= requiredSlots) {
+    if (submittingKey) return;
+
+    const daySchedule = schedules.filter((s) => s.work_date === workDate && s.slot_id !== null && s.is_selected);
+    const currentSelectedIds = daySchedule.map((s) => s.slot_id!) as string[];
+    const isAlreadySelected = currentSelectedIds.includes(slotId);
+
+    if (!isAlreadySelected && requiredSlots > 0 && currentSelectedIds.length >= requiredSlots) {
+      if (requiredSlots === 1 && currentSelectedIds.length === 1) {
+        const [existingSlotId] = currentSelectedIds;
+        setSubmittingKey(`slot-${workDate}`);
+        setMessage(null);
+        const { error: deselectError } = await supabase.rpc("toggle_rider_slot", {
+          p_rider_id: rider.rider_id,
+          p_week_id: week.id,
+          p_work_date: workDate,
+          p_slot_id: existingSlotId,
+        });
+        if (deselectError) {
+          setSubmittingKey(null);
+          setMessage(deselectError.message);
+          await refreshRiderSchedules();
+          return;
+        }
+        const { error: selectError } = await supabase.rpc("toggle_rider_slot", {
+          p_rider_id: rider.rider_id,
+          p_week_id: week.id,
+          p_work_date: workDate,
+          p_slot_id: slotId,
+        });
+        setSubmittingKey(null);
+        if (selectError) {
+          setMessage(selectError.message);
+        }
+        await refreshRiderSchedules();
+        return;
+      }
+
       setMessage(`每天只能选择 ${requiredSlots} 个时段`);
       return;
     }
-    
-    setSubmittingKey(key);
+
+    setSubmittingKey(`slot-${workDate}`);
     setMessage(null);
 
     const { error } = await supabase.rpc("toggle_rider_slot", {
@@ -236,7 +276,10 @@ export default function WeekSchedulePage() {
     });
 
     setSubmittingKey(null);
-    if (error) setMessage(error.message);
+    if (error) {
+      setMessage(error.message);
+    }
+    await refreshRiderSchedules();
   }
 
   async function confirmSetRest() {
@@ -263,17 +306,6 @@ export default function WeekSchedulePage() {
 
     if (error) { setMessage(error.message); return; }
     setMessage("已设为排休");
-  }
-
-  async function handleCancelRest(workDate: string) {
-    if (!week || !rider) return;
-    setMessage(null);
-    const { error } = await supabase.rpc("cancel_rider_rest", {
-      p_rider_id: rider.rider_id,
-      p_week_id: week.id,
-      p_work_date: workDate,
-    });
-    if (error) setMessage(error.message);
   }
 
   if (weekLoading) {
@@ -345,7 +377,7 @@ export default function WeekSchedulePage() {
                 <div className="card-header">
                   <div className="date-info">
                     <strong>{day.weekdayLabel}</strong>
-                    <span>{day.shortDate}</span>
+                    <span>{day.shortDate} · 需选{requiredSlots}个时段</span>
                   </div>
                   <div className={`quota-pill ${remaining <= 0 ? "full" : ""}`}>
                     {remaining > 0 ? `剩余 ${remaining} 排休空位` : "排休人数已满"}
@@ -356,28 +388,32 @@ export default function WeekSchedulePage() {
                   {day.isRest ? (
                     <div className="status-rested">
                       已排休
-                      <button className="btn-ghost btn-sm" type="button" onClick={() => handleCancelRest(day.date)} style={{ marginLeft: "8px", padding: "4px 10px", fontSize: "12px" }}>
-                        取消排休
-                      </button>
                     </div>
                   ) : (
                     <>
-                      <div style={{ fontSize: "13px", color: "var(--text-muted)", marginBottom: "8px", textAlign: "center" }}>
-                         已选 {day.selectedCount} / 必须选 {requiredSlots} 个时段
-                        {!canSelectEnough ? <span style={{ color: "var(--danger-color)", marginLeft: "6px" }}>不足！</span> : null}
-                      </div>
+                      {!canSelectEnough ? (
+                        <div style={{ fontSize: "13px", color: "var(--danger-color)", marginBottom: "8px", textAlign: "center" }}>
+                          不足！已选{day.selectedCount}个
+                        </div>
+                      ) : null}
 
                       {selectableSlots.length > 0 ? (
                         <div className="segment-control">
                           {selectableSlots.map((slot) => {
                             const isSelected = day.selectedSlotIds.includes(slot.id);
+                            const isSubmitting = submittingKey === `slot-${day.date}`;
                             return (
                               <button key={slot.id}
                                 className={`segment-btn ${isSelected ? "active" : ""}`}
                                 type="button"
                                 onClick={() => handleToggleSlot(day.date, slot.id)}
-                                disabled={submittingKey === `${day.date}-${slot.id}`}>
-                                {slot.name}
+                                disabled={isSubmitting}
+                                style={{
+                                  opacity: isSubmitting ? 0.6 : 1,
+                                  cursor: isSubmitting ? "wait" : "pointer",
+                                  transition: "all 0.2s ease",
+                                }}>
+                                {isSubmitting ? "..." : slot.name}
                               </button>
                             );
                           })}

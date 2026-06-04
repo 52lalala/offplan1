@@ -52,6 +52,18 @@ select {
   padding: 20px;
 }
 
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+}
+
 .welcome-overlay {
   background: rgba(242, 242, 247, 0.85);
   backdrop-filter: blur(10px);
@@ -318,7 +330,6 @@ select {
 }
 
 .date-info span {
-  margin-top: 2px;
   font-size: 13px;
   color: var(--text-muted);
 }
@@ -370,19 +381,16 @@ select {
   -webkit-tap-highlight-color: transparent;
 }
 
-.segment-btn:active {
-  background: transparent;
-  color: inherit;
-}
-
-.segment-btn:not(:disabled):hover {
-  background: transparent;
-  color: var(--text-main);
+@media (hover: hover) {
+  .segment-btn:not(:disabled):hover {
+    background: transparent;
+    color: var(--text-main);
+  }
 }
 
 .segment-btn.active {
-  background: var(--card-bg);
-  color: var(--accent-color);
+  background: var(--card-bg) !important;
+  color: var(--accent-color) !important;
   box-shadow: 0 2px 8px rgba(99, 102, 241, 0.15);
   font-weight: 700;
   transform: scale(1.02);
@@ -598,7 +606,7 @@ select {
 .config-card {
   border: 1px solid var(--border-color);
   border-radius: 16px;
-  padding: 18px;
+  padding: 20px;
   background: var(--surface-muted);
   display: flex;
   flex-direction: column;
@@ -608,12 +616,13 @@ select {
 
 .config-card:hover {
   box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
 }
 
 .config-card.active-card {
   background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
   border-color: var(--accent-color);
-  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
 }
 
 .card-actions-row {

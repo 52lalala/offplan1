@@ -38,6 +38,9 @@ export function parseXlsFile(buffer: ArrayBuffer): XlsData {
   }
 
   const slots: XlsSlotDef[] = [];
+  const slotLabels: string[] = [];
+  const slotColumnIndexes: number[] = [];
+  let slotOrder = 1;
   for (let i = actualSlotStart; i < header.length; i++) {
     const h = header[i];
     if (!h?.trim()) continue;
@@ -45,8 +48,11 @@ export function parseXlsFile(buffer: ArrayBuffer): XlsData {
       name: extractSlotName(h),
       startTime: parseTimeRange(h).startTime,
       endTime: parseTimeRange(h).endTime,
-      sortOrder: i - actualSlotStart + 1,
+      sortOrder: slotOrder,
     });
+    slotLabels.push(h);
+    slotColumnIndexes.push(i);
+    slotOrder += 1;
   }
 
   const groupId = String(rows[1]?.[0] ?? "").trim();
@@ -93,11 +99,32 @@ export function parseXlsFile(buffer: ArrayBuffer): XlsData {
     entries.push({ riderId, riderName, date: dateStr, selections });
   }
 
+  const columnCount = header.length;
+  const snapshotRows = rows.slice(1).map((row) => {
+    const arr: (string | number | null)[] = [];
+    for (let i = 0; i < columnCount; i++) {
+      const value = row?.[i];
+      if (value === undefined) {
+        arr.push("");
+      } else {
+        arr.push(value as string | number | null);
+      }
+    }
+    return arr;
+  });
+
   return {
     weekStart,
     weekEnd,
     group: { id: groupId, name: groupName },
     slots,
     entries,
+    slotLabels,
+    slotColumnIndexes,
+    baseColumnCount: actualSlotStart,
+    snapshot: {
+      header: header.slice(0, columnCount),
+      rows: snapshotRows,
+    },
   };
 }

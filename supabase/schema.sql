@@ -11,6 +11,7 @@ drop table if exists public.rest_week_members cascade;
 drop table if exists public.rest_periods cascade;
 drop table if exists public.employee_week_shifts cascade;
 drop table if exists public.rider_schedules cascade;
+drop table if exists public.week_import_snapshots cascade;
 drop table if exists public.rider_week_rosters cascade;
 drop table if exists public.time_slots cascade;
 drop table if exists public.riders cascade;
@@ -23,6 +24,7 @@ drop table if exists public.schedule_weeks cascade;
 -- 排班周
 create table public.schedule_weeks (
   id uuid primary key default gen_random_uuid(),
+  name text not null default '',
   start_date date not null,
   end_date date not null,
   is_active boolean not null default false,
@@ -48,13 +50,15 @@ create table public.time_slots (
 
 -- 骑手表
 create table public.riders (
-  rider_id text primary key,
+  rider_id text not null,
+  week_id uuid not null references public.schedule_weeks(id) on delete cascade,
   name text not null check (char_length(trim(name)) between 1 and 20),
   group_id text not null default '',
   group_name text not null default '',
   rider_type text not null default '',
   is_active boolean not null default true,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  primary key (rider_id, week_id)
 );
 
 -- 每日排休名额
@@ -73,14 +77,26 @@ create table public.rest_day_limits (
 -- slot_id is not null => is_selected 标记该时段是否出勤
 create table public.rider_schedules (
   id uuid primary key default gen_random_uuid(),
-  rider_id text not null references public.riders(rider_id) on delete cascade,
+  rider_id text not null,
   week_id uuid not null references public.schedule_weeks(id) on delete cascade,
   work_date date not null,
   slot_id uuid references public.time_slots(id) on delete cascade,
   is_selected boolean,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique (rider_id, work_date, slot_id)
+  unique (rider_id, work_date, slot_id),
+  foreign key (rider_id, week_id) references public.riders(rider_id, week_id) on delete cascade
+);
+
+-- XLS 导入快照（用于导出原始模板）
+create table public.week_import_snapshots (
+  week_id uuid primary key references public.schedule_weeks(id) on delete cascade,
+  header jsonb not null,
+  rows jsonb not null,
+  base_columns integer not null,
+  slot_labels jsonb not null,
+  slot_indexes jsonb not null,
+  created_at timestamptz not null default now()
 );
 
 -- ==================== 4. 索引 ====================
@@ -95,6 +111,7 @@ create index idx_rs_week on public.rider_schedules (week_id);
 create index idx_rs_rider_week on public.rider_schedules (rider_id, week_id);
 create index idx_rs_work_date on public.rider_schedules (work_date);
 create index idx_ts_week on public.time_slots (week_id, sort_order);
+create index idx_riders_week on public.riders (week_id);
 create index idx_rdl_week on public.rest_day_limits (week_start);
 create index idx_sw_active on public.schedule_weeks (is_active, start_date desc);
 
@@ -109,7 +126,7 @@ end;
 $$;
 
 -- 批量导入 XLS 数据（事务内完成）
--- 仅导入骑手和时段结构，不清除骑手已有排班选择
+-- 会重置该周的时段、排班记录，并保存原始导入快照
 -- p_data jsonb 格式：
 -- {
 --   "weekStart": "2026-06-01",
@@ -131,14 +148,16 @@ declare
   v_entry jsonb;
   v_rider_id text;
   v_rider_name text;
+  v_slot_ids uuid[];
+  v_slot_idx integer;
+  v_selection integer;
+  v_work_date date;
 begin
   v_group_id := p_data->'group'->>'id';
   v_group_name := p_data->'group'->>'name';
 
-  -- 清空该周旧排班数据
+  delete from public.week_import_snapshots where week_id = p_week_id;
   delete from public.rider_schedules where week_id = p_week_id;
-
-  -- 清空旧时段并重建
   delete from public.time_slots where week_id = p_week_id;
 
   for v_slot in select * from jsonb_array_elements(p_data->'slots')
@@ -154,23 +173,233 @@ begin
     );
   end loop;
 
-  -- 仅导入骑手名单，不导入排班选择
+  select array_agg(id order by sort_order) into v_slot_ids
+  from public.time_slots where week_id = p_week_id;
+
+  -- 导入骑手名单，并根据原始 0/1 填充初始排班
   for v_entry in select * from jsonb_array_elements(p_data->'entries')
   loop
     v_rider_id := v_entry->>'riderId';
     v_rider_name := v_entry->>'riderName';
 
     if v_rider_id is not null and v_rider_name is not null then
-      insert into public.riders (rider_id, name, group_id, group_name)
-      values (v_rider_id, v_rider_name, v_group_id, v_group_name)
-      on conflict (rider_id) do update set
+      insert into public.riders (rider_id, week_id, name, group_id, group_name)
+      values (v_rider_id, p_week_id, v_rider_name, v_group_id, v_group_name)
+      on conflict (rider_id, week_id) do update set
         name = v_rider_name,
         group_id = v_group_id,
         group_name = v_group_name;
+
+      if v_slot_ids is not null then
+        v_work_date := to_date(v_entry->>'date', 'YYYYMMDD');
+        if v_work_date is not null then
+          for v_slot_idx in 1..coalesce(array_length(v_slot_ids, 1), 0)
+          loop
+            v_selection := coalesce((v_entry->'selections'->>(v_slot_idx - 1)), '0')::int;
+            if v_selection = 1 then
+              insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+              values (v_rider_id, p_week_id, v_work_date, v_slot_ids[v_slot_idx], true)
+              on conflict (rider_id, work_date, slot_id) where slot_id is not null
+              do update set is_selected = true;
+            end if;
+          end loop;
+        end if;
+      end if;
     end if;
   end loop;
 
-  return jsonb_build_object('success', true, 'message', '导入完成（仅骑手名单和时段，员工需重新选择排班）');
+  if coalesce(jsonb_array_length(p_data->'snapshot'->'header'), 0) > 0 then
+    insert into public.week_import_snapshots (week_id, header, rows, base_columns, slot_labels, slot_indexes)
+    values (
+      p_week_id,
+      coalesce(p_data->'snapshot'->'header', '[]'::jsonb),
+      coalesce(p_data->'snapshot'->'rows', '[]'::jsonb),
+      coalesce((p_data->>'baseColumnCount')::int, 6),
+      coalesce(p_data->'slotLabels', '[]'::jsonb),
+      coalesce(p_data->'slotColumnIndexes', '[]'::jsonb)
+    )
+    on conflict (week_id) do update set
+      header = excluded.header,
+      rows = excluded.rows,
+      base_columns = excluded.base_columns,
+      slot_labels = excluded.slot_labels,
+      slot_indexes = excluded.slot_indexes,
+      created_at = now();
+  end if;
+
+  return jsonb_build_object('success', true, 'message', '导入完成（已更新骑手名单、时段与初始选择）');
+end;
+$$;
+
+create or replace function public.export_xls_week(p_week_id uuid)
+returns jsonb language plpgsql
+as $$
+declare
+  v_snapshot record;
+  header_text text[];
+  slot_labels text[];
+  slot_col_positions int[];
+  base_columns integer;
+  header_len integer;
+  slot_count integer;
+  result_rows jsonb := '[]'::jsonb;
+  row_json jsonb;
+  cell record;
+  arr text[];
+  rider_col integer;
+  date_col integer;
+  rider_id text;
+  date_key text;
+  slot_json jsonb;
+  selection_map jsonb := '{}'::jsonb;
+  map_key text;
+  idx integer;
+  col_index integer;
+  v_slot_ids uuid[];
+  fallback boolean := false;
+  start_date date;
+  end_date date;
+  cur_date date;
+  rider_rec record;
+begin
+  select array_agg(ts.id order by ts.sort_order) into v_slot_ids
+  from public.time_slots ts where ts.week_id = p_week_id;
+
+  select jsonb_object_agg(key, value) into selection_map
+  from (
+    select rs.rider_id || '_' || to_char(rs.work_date, 'YYYYMMDD') as key,
+           jsonb_object_agg(array_idx::text, to_jsonb((rs.is_selected is true)::int)) as value
+    from (
+      select rs.rider_id, rs.work_date, rs.is_selected, rs.slot_id,
+             array_position(v_slot_ids, rs.slot_id) as array_idx
+      from public.rider_schedules rs
+      join public.time_slots ts on ts.id = rs.slot_id
+      where rs.week_id = p_week_id and rs.slot_id is not null
+    ) rs
+    group by rs.rider_id, rs.work_date
+  ) s;
+  if selection_map is null then
+    selection_map := '{}'::jsonb;
+  end if;
+
+  select * into v_snapshot from public.week_import_snapshots where week_id = p_week_id;
+
+  if v_snapshot is null then
+    fallback := true;
+    select start_date, end_date into start_date, end_date
+    from public.schedule_weeks where id = p_week_id;
+
+    header_text := ARRAY['管理组ID', '管理组名称', '骑手ID', '骑手姓名', '日期', '骑手类型'];
+    base_columns := array_length(header_text, 1);
+
+    slot_labels := ARRAY[]::text[];
+    if v_slot_ids is not null then
+      select array_agg(ts.name || '|' || to_char(ts.start_time, 'HH24:MI') || '-' || to_char(ts.end_time, 'HH24:MI')
+             order by ts.sort_order)
+      into slot_labels
+      from public.time_slots ts
+      where ts.week_id = p_week_id;
+    end if;
+
+    slot_count := coalesce(array_length(slot_labels, 1), 0);
+    slot_col_positions := ARRAY(SELECT base_columns + i - 1 FROM generate_series(1, slot_count) g(i));
+    header_text := header_text || slot_labels;
+    header_len := array_length(header_text, 1);
+    rider_col := 3;
+    date_col := 5;
+
+    if start_date is null or end_date is null then
+      return jsonb_build_object(
+        'header', to_jsonb(header_text),
+        'rows', '[]'::jsonb,
+        'slotLabels', to_jsonb(slot_labels),
+        'slotColumnIndexes', to_jsonb(slot_col_positions),
+        'baseColumns', base_columns,
+        'generated', true
+      );
+    end if;
+
+    for rider_rec in
+      select rider_id, name, group_id, group_name, rider_type
+      from public.riders where week_id = p_week_id
+      order by name
+    loop
+      cur_date := start_date;
+
+      while cur_date <= end_date loop
+        arr := array_fill(''::text, ARRAY[header_len]);
+        arr[1] := coalesce(rider_rec.group_id, '');
+        arr[2] := coalesce(rider_rec.group_name, '');
+        arr[3] := coalesce(rider_rec.rider_id, '');
+        arr[4] := coalesce(rider_rec.name, '');
+        arr[5] := to_char(cur_date, 'YYYYMMDD');
+        arr[6] := coalesce(rider_rec.rider_type, '');
+        map_key := coalesce(rider_rec.rider_id, '') || '_' || to_char(cur_date, 'YYYYMMDD');
+        slot_json := coalesce(selection_map -> map_key, '{}'::jsonb);
+        for idx in 1..slot_count loop
+          arr[base_columns + idx] := coalesce(slot_json->>(idx::text), '0');
+        end loop;
+        result_rows := result_rows || jsonb_build_array(to_jsonb(arr));
+        cur_date := cur_date + interval '1 day';
+      end loop;
+    end loop;
+
+    return jsonb_build_object(
+      'header', to_jsonb(header_text),
+      'rows', result_rows,
+      'slotLabels', to_jsonb(slot_labels),
+      'slotColumnIndexes', to_jsonb(slot_col_positions),
+      'baseColumns', base_columns,
+      'generated', true
+    );
+  end if;
+
+  select array_agg(value order by ord) into header_text
+  from jsonb_array_elements_text(v_snapshot.header) with ordinality as t(value, ord);
+  select array_agg((value)::int order by ord) into slot_col_positions
+  from jsonb_array_elements_text(v_snapshot.slot_indexes) with ordinality as t(value, ord);
+  select array_agg(value order by ord) into slot_labels
+  from jsonb_array_elements_text(v_snapshot.slot_labels) with ordinality as t(value, ord);
+
+  base_columns := coalesce(v_snapshot.base_columns, 6);
+  header_len := coalesce(array_length(header_text, 1), 0);
+  slot_count := coalesce(array_length(slot_col_positions, 1), 0);
+  rider_col := coalesce(array_position(header_text, '骑手ID'), 3);
+  date_col := coalesce(array_position(header_text, '日期'), 5);
+
+  for row_json in select value from jsonb_array_elements(v_snapshot.rows)
+  loop
+    arr := array_fill(''::text, ARRAY[header_len]);
+    for cell in select value, ord from jsonb_array_elements_text(row_json) with ordinality as t(value, ord)
+    loop
+      if cell.ord <= header_len then
+        arr[cell.ord] = cell.value;
+      end if;
+    end loop;
+
+    rider_id := coalesce(arr[rider_col], '');
+    date_key := coalesce(arr[date_col], '');
+    map_key := rider_id || '_' || date_key;
+    slot_json := coalesce(selection_map -> map_key, '{}'::jsonb);
+
+    for idx in 1..slot_count loop
+      col_index := slot_col_positions[idx] + 1;
+      if col_index between 1 and header_len then
+        arr[col_index] := coalesce(slot_json->>(idx::text), '0');
+      end if;
+    end loop;
+
+    result_rows := result_rows || jsonb_build_array(to_jsonb(arr));
+  end loop;
+
+  return jsonb_build_object(
+    'header', to_jsonb(header_text),
+    'rows', result_rows,
+    'slotLabels', to_jsonb(slot_labels),
+    'slotColumnIndexes', to_jsonb(slot_col_positions),
+    'baseColumns', base_columns,
+    'generated', false
+  );
 end;
 $$;
 
@@ -203,10 +432,7 @@ begin
   ) order by r.name)
   into v_result
   from public.riders r
-  where exists (
-    select 1 from public.rider_schedules rs
-    where rs.rider_id = r.rider_id and rs.week_id = p_week_id
-  );
+  where r.week_id = p_week_id;
   return coalesce(v_result, '[]'::jsonb);
 end;
 $$;
@@ -480,6 +706,7 @@ alter table public.time_slots enable row level security;
 alter table public.riders enable row level security;
 alter table public.rest_day_limits enable row level security;
 alter table public.rider_schedules enable row level security;
+alter table public.week_import_snapshots enable row level security;
 
 create policy "public read" on public.schedule_weeks for select to anon, authenticated using (true);
 create policy "public write" on public.schedule_weeks for all to anon, authenticated using (true) with check (true);
@@ -491,6 +718,8 @@ create policy "public read" on public.rest_day_limits for select to anon, authen
 create policy "public write" on public.rest_day_limits for all to anon, authenticated using (true) with check (true);
 create policy "public read" on public.rider_schedules for select to anon, authenticated using (true);
 create policy "public write" on public.rider_schedules for all to anon, authenticated using (true) with check (true);
+create policy "public read" on public.week_import_snapshots for select to anon, authenticated using (true);
+create policy "public write" on public.week_import_snapshots for all to anon, authenticated using (true) with check (true);
 
 -- ==================== 8. 权限 ====================
 
@@ -500,8 +729,10 @@ grant all on public.time_slots to anon, authenticated;
 grant all on public.riders to anon, authenticated;
 grant all on public.rest_day_limits to anon, authenticated;
 grant all on public.rider_schedules to anon, authenticated;
+grant all on public.week_import_snapshots to anon, authenticated;
 
 grant execute on function public.import_xls_week to anon, authenticated;
+grant execute on function public.export_xls_week to anon, authenticated;
 grant execute on function public.clear_week_schedules to anon, authenticated;
 grant execute on function public.get_week_riders to anon, authenticated;
 grant execute on function public.get_week_slots to anon, authenticated;

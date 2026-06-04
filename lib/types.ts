@@ -1,5 +1,6 @@
 export type ScheduleWeekRow = {
   id: string;
+  name: string;
   start_date: string;
   end_date: string;
   is_active: boolean;
@@ -19,6 +20,7 @@ export type TimeSlotRow = {
 
 export type RiderRow = {
   rider_id: string;
+  week_id: string;
   name: string;
   group_id: string;
   group_name: string;
@@ -54,10 +56,28 @@ export type XlsEntry = {
   selections: number[];
 };
 
+export type XlsSnapshot = {
+  header: (string | number | null)[];
+  rows: (string | number | null)[][];
+};
+
 export type XlsData = {
   weekStart: string;
   weekEnd: string;
   group: { id: string; name: string };
   slots: XlsSlotDef[];
   entries: XlsEntry[];
+  slotLabels: string[];
+  slotColumnIndexes: number[];
+  baseColumnCount: number;
+  snapshot: XlsSnapshot;
+};
+
+export type ExportXlsData = {
+  header: (string | number | null)[];
+  rows: (string | number | null)[][];
+  slotLabels: string[];
+  slotColumnIndexes: number[];
+  baseColumns: number;
+  generated: boolean;
 };

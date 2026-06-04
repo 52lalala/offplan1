@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState, useRef } from "react";
+import { useRouter } from "next/navigation";
+import * as XLSX from "xlsx";
 import { buildDaysFromRange, formatWeekRange, getWeekStart, formatDateKey } from "@/lib/date";
 import { supabase } from "@/lib/supabase";
 import { parseXlsFile } from "@/lib/xls";
-import type { ScheduleWeekRow, TimeSlotRow, RiderRow, RestDayLimitRow, RiderScheduleRow, XlsData } from "@/lib/types";
+import type { ScheduleWeekRow, TimeSlotRow, RiderRow, RestDayLimitRow, RiderScheduleRow, ExportXlsData } from "@/lib/types";
 
 const DEFAULT_WEEKDAY_LIMIT = 5;
 const DEFAULT_WEEKEND_LIMIT = 2;
@@ -25,6 +27,7 @@ function createDraftWeek(): ScheduleWeekRow {
   sunday.setDate(sunday.getDate() + 6);
   return {
     id: `draft-${uid()}`,
+    name: "",
     start_date: formatDateKey(monday),
     end_date: formatDateKey(sunday),
     is_active: false,
@@ -33,7 +36,9 @@ function createDraftWeek(): ScheduleWeekRow {
 }
 
 export default function AdminPage() {
+  const router = useRouter();
   const [weeks, setWeeks] = useState<ScheduleWeekRow[]>([]);
+  const [loadingWeeks, setLoadingWeeks] = useState(true);
   const [activeWeek, setActiveWeek] = useState<ScheduleWeekRow | null>(null);
   const [riderMap, setRiderMap] = useState<Record<string, RiderRow>>({});
   const [slots, setSlots] = useState<TimeSlotRow[]>([]);
@@ -42,13 +47,16 @@ export default function AdminPage() {
   const [message, setMessage] = useState<string | null>(null);
 
   const [savingWeekId, setSavingWeekId] = useState<string | null>(null);
-  const [editingMemberWeekId, setEditingMemberWeekId] = useState<string | null>(null);
-  const [savingAll, setSavingAll] = useState(false);
   const [showPendingOnly, setShowPendingOnly] = useState(false);
-
-  const [importing, setImporting] = useState(false);
-  const [previewData, setPreviewData] = useState<XlsData | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [newWeekName, setNewWeekName] = useState("");
+  const [newWeekStart, setNewWeekStart] = useState("");
+  const [newWeekEnd, setNewWeekEnd] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [importingWeekId, setImportingWeekId] = useState<string | null>(null);
+  const [exportingWeekId, setExportingWeekId] = useState<string | null>(null);
+  const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
 
   const weekDays = useMemo(() => {
     if (!activeWeek) return [];
@@ -73,32 +81,32 @@ export default function AdminPage() {
 
   const requestSummaries = useMemo(() => {
     const grouped = new Map<string, RiderScheduleRow[]>();
-    for (const s of schedules) {
-      const list = grouped.get(s.rider_id) ?? [];
-      list.push(s);
-      grouped.set(s.rider_id, list);
+    for (const schedule of schedules) {
+      const list = grouped.get(schedule.rider_id) ?? [];
+      list.push(schedule);
+      grouped.set(schedule.rider_id, list);
     }
 
     return Array.from(grouped.entries())
       .sort((a, b) => (riderMap[a[0]]?.name ?? "").localeCompare(riderMap[b[0]]?.name ?? "", "zh-CN"))
       .map(([riderId, riderSchedules]) => {
         const shiftsByDate = new Map<string, RiderScheduleRow[]>();
-        for (const s of riderSchedules) {
-          const list = shiftsByDate.get(s.work_date) ?? [];
-          list.push(s);
-          shiftsByDate.set(s.work_date, list);
+        for (const schedule of riderSchedules) {
+          const list = shiftsByDate.get(schedule.work_date) ?? [];
+          list.push(schedule);
+          shiftsByDate.set(schedule.work_date, list);
         }
 
         const dayTexts = weekDays.map((day) => {
           const dayShifts = shiftsByDate.get(day.key);
           if (!dayShifts || dayShifts.length === 0) return `${day.weekdayLabel} 未生成`;
 
-          const restEntry = dayShifts.find((s) => s.slot_id === null);
+          const restEntry = dayShifts.find((shift) => shift.slot_id === null);
           if (restEntry) return `${day.weekdayLabel} 排休`;
 
           const selectedSlots = dayShifts
-            .filter((s) => s.is_selected === true && s.slot_id !== null)
-            .map((s) => (slotMap[s.slot_id!] ? slotMap[s.slot_id!].name : "?"));
+            .filter((shift) => shift.is_selected === true && shift.slot_id !== null)
+            .map((shift) => (slotMap[shift.slot_id!] ? slotMap[shift.slot_id!].name : "?"));
 
           if (selectedSlots.length === 0) return `${day.weekdayLabel} 未选`;
 
@@ -109,25 +117,55 @@ export default function AdminPage() {
       });
   }, [riderMap, schedules, slotMap, weekDays]);
 
+  async function handleXlsExport(week: ScheduleWeekRow) {
+    setExportingWeekId(week.id);
+    setMessage(null);
+    try {
+      const { data, error } = await supabase.rpc("export_xls_week", { p_week_id: week.id });
+      if (error) {
+        setMessage(`导出失败：${error.message}`);
+        return;
+      }
+      if (!data) {
+        setMessage("导出失败：未获取到数据");
+        return;
+      }
+
+      const payload = data as ExportXlsData;
+      const toArray = (value: unknown): (string | number | null)[] => (Array.isArray(value) ? value : []);
+      const header = toArray(payload.header);
+      const rows = (Array.isArray(payload.rows) ? payload.rows : []).map(toArray);
+      const aoa = [header, ...rows].map((row) => row.map((cell) => (cell ?? "")));
+
+      const worksheet = XLSX.utils.aoa_to_sheet(aoa);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "排班数据");
+
+      const fileName = `${week.name || formatWeekRange(week.start_date, week.end_date)}-排班.xls`;
+      XLSX.writeFile(workbook, fileName, { bookType: 'xls' });
+      setMessage(payload.generated ? "导出成功（基于当前排班生成）" : "导出成功（保持导入模板结构）");
+    } catch (err: unknown) {
+      setMessage(`导出失败：${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setExportingWeekId(null);
+    }
+  }
+
   useEffect(() => {
     async function load() {
-      const [weeksRes, ridersRes] = await Promise.all([
-        supabase.from("schedule_weeks").select("*").order("start_date", { ascending: false }),
-        supabase.from("riders").select("*"),
-      ]);
+      setLoadingWeeks(true);
+      const weeksRes = await supabase.from("schedule_weeks").select("*").order("start_date", { ascending: false });
       if (weeksRes.data) {
         setWeeks(weeksRes.data);
         setActiveWeek(weeksRes.data.find((w) => w.is_active) ?? weeksRes.data[0] ?? null);
       }
-      if (ridersRes.data) {
-        setRiderMap(ridersRes.data.reduce<Record<string, RiderRow>>((acc, r) => { acc[r.rider_id] = r; return acc; }, {}));
-      }
+      setLoadingWeeks(false);
     }
     void load();
   }, []);
 
   useEffect(() => {
-    if (!activeWeek) { setSlots([]); setSchedules([]); setLimits({}); return; }
+    if (!activeWeek) { setSlots([]); setSchedules([]); setLimits({}); setRiderMap({}); return; }
     const curWeek = activeWeek;
     const ws = curWeek.start_date;
     async function loadWeek() {
@@ -135,7 +173,7 @@ export default function AdminPage() {
         supabase.from("time_slots").select("*").eq("week_id", curWeek.id).order("sort_order"),
         supabase.from("rider_schedules").select("*").eq("week_id", curWeek.id),
         supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", ws),
-        supabase.from("riders").select("*"),
+        supabase.from("riders").select("*").eq("week_id", curWeek.id),
       ]);
       if (slotsRes.data) setSlots(slotsRes.data);
       if (schedulesRes.data) setSchedules(schedulesRes.data);
@@ -180,8 +218,9 @@ export default function AdminPage() {
         const { data } = await supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", activeWeek.start_date);
         if (data) setLimits(data.reduce<Record<string, number>>((acc, r) => { acc[r.rest_date] = r.max_slots; return acc; }, {}));
       })
-      .on("postgres_changes", { event: "*", schema: "public", table: "riders" }, async () => {
-        const { data } = await supabase.from("riders").select("*");
+      .on("postgres_changes", { event: "*", schema: "public", table: "riders", filter: activeWeek ? `week_id=eq.${activeWeek.id}` : undefined }, async () => {
+        if (!activeWeek) return;
+        const { data } = await supabase.from("riders").select("*").eq("week_id", activeWeek.id);
         if (data) setRiderMap(data.reduce<Record<string, RiderRow>>((acc, r) => { acc[r.rider_id] = r; return acc; }, {}));
       })
       .subscribe();
@@ -225,12 +264,12 @@ export default function AdminPage() {
     if (weekId.startsWith("draft-")) {
       setWeeks((cur) => cur.filter((w) => w.id !== weekId));
       setSavingWeekId(null);
+      setShowDeleteConfirm(null);
       return;
     }
     const week = weeks.find((w) => w.id === weekId);
     if (week) {
       await Promise.all([
-        supabase.from("rider_schedules").delete().eq("week_id", weekId),
         supabase.from("rest_day_limits").delete().eq("week_start", week.start_date),
       ]);
     }
@@ -238,75 +277,68 @@ export default function AdminPage() {
     setSavingWeekId(null);
     if (error) { setMessage(error.message); return; }
     if (activeWeek?.id === weekId) setActiveWeek(null);
+    setShowDeleteConfirm(null);
     setMessage("排休周已删除。");
   }
 
-  async function handleFileUpload(event: React.ChangeEvent<HTMLInputElement>) {
+  async function handleCreateWeek() {
+    if (!newWeekName.trim() || !newWeekStart || !newWeekEnd) {
+      setMessage("请填写完整的名称和日期");
+      return;
+    }
+    setCreating(true);
+    setMessage(null);
+    const { data, error } = await supabase.from("schedule_weeks").insert({
+      name: newWeekName.trim(),
+      start_date: newWeekStart,
+      end_date: newWeekEnd,
+      is_active: false,
+      required_slots: 3,
+    }).select().single();
+    setCreating(false);
+    if (error) {
+      setMessage(error.message);
+      return;
+    }
+    if (data) {
+      setWeeks((cur) => [data, ...cur]);
+      setShowCreateModal(false);
+      setNewWeekName("");
+      setNewWeekStart("");
+      setNewWeekEnd("");
+      setMessage("排休周已创建，点击编辑配置进行详细设置");
+    }
+  }
+
+  async function handleXlsImport(weekId: string, event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
+    setImportingWeekId(weekId);
+    setMessage(null);
     try {
       const buf = await file.arrayBuffer();
       const data = parseXlsFile(buf);
-      setPreviewData(data);
-      setMessage(`解析完成：${data.slots.length} 个时段，${data.entries.length} 条排班记录`);
+      const { error } = await supabase.rpc("import_xls_week", {
+        p_week_id: weekId,
+        p_data: data,
+      });
+      if (error) {
+        setMessage(`导入失败：${error.message}`);
+      } else {
+        setMessage("导入成功");
+      }
     } catch (e: unknown) {
       setMessage(`解析失败：${e instanceof Error ? e.message : "未知错误"}`);
     }
+    setImportingWeekId(null);
     event.target.value = "";
-  }
-
-  async function confirmImport() {
-    if (!activeWeek || !previewData) return;
-    setImporting(true);
-    setMessage(null);
-    const { error } = await supabase.rpc("import_xls_week", {
-      p_week_id: activeWeek.id,
-      p_data: previewData,
-    });
-    setImporting(false);
-    if (error) { setMessage(error.message); return; }
-    setPreviewData(null);
-    setMessage("导入成功");
-  }
-
-  async function clearSchedules() {
-    if (!activeWeek) return;
-    setMessage(null);
-    const { error } = await supabase.rpc("clear_week_schedules", { p_week_id: activeWeek.id });
-    if (error) { setMessage(error.message); return; }
-    setMessage("排班已清空");
-  }
-
-  async function toggleSlotSelectable(slotId: string) {
-    const { error } = await supabase.rpc("toggle_slot_selectable", { p_slot_id: slotId });
-    if (error) setMessage(error.message);
-  }
-
-  async function setWeekRequiredSlots(weekId: string, requiredSlots: number) {
-    const { error } = await supabase.rpc("set_week_required_slots", { p_week_id: weekId, p_required_slots: requiredSlots });
-    if (error) setMessage(error.message);
-  }
-
-  async function saveAllLimits() {
-    if (!activeWeek) return;
-    setSavingAll(true);
-    setMessage(null);
-    const rows = weekDays.map((day) => ({
-      week_start: activeWeek.start_date,
-      rest_date: day.key,
-      max_slots: limits[day.key] ?? getDefaultLimit(day.key),
-    }));
-    const { error } = await supabase.from("rest_day_limits").upsert(rows, { onConflict: "week_start,rest_date" });
-    setSavingAll(false);
-    if (error) { setMessage(error.message); return; }
-    setMessage("名额已保存");
   }
 
   return (
     <main className="page-container">
       <header className="page-header">
         <h1>后台管理</h1>
-        <p>XLS 导入 · 骑手时段配置 · 排班总览 · 总骑手 {Object.keys(riderMap).length}</p>
+        <p>排班周管理 · 排班总览</p>
       </header>
       {message ? <div className="toast-pill">{message}</div> : null}
 
@@ -315,143 +347,93 @@ export default function AdminPage() {
         <div className="section-header">
           <div>
             <h2>排班周配置</h2>
-            <p>启用周决定员工端展示哪一周</p>
+            <p>点击卡片切换排班总览</p>
           </div>
-          <button className="btn-primary btn-sm" type="button" onClick={() => setWeeks((cur) => [createDraftWeek(), ...cur])}>+ 新增一周</button>
+          <button className="btn-primary btn-sm" type="button" onClick={() => setShowCreateModal(true)}>+ 新增一周</button>
         </div>
-        <div className="config-grid">
-          {weeks.map((week) => (
-            <div className={`config-card ${week.is_active ? "active-card" : ""}`} key={week.id}>
-              <div className="input-group">
-                <input type="date" className="clean-input" value={week.start_date}
-                  onChange={(e) => setWeeks((cur) => cur.map((w) => w.id === week.id ? { ...w, start_date: e.target.value } : w))} />
-                <input type="date" className="clean-input" value={week.end_date}
-                  onChange={(e) => setWeeks((cur) => cur.map((w) => w.id === week.id ? { ...w, end_date: e.target.value } : w))} />
-                <label className="switch-label">
-                  <input type="checkbox" checked={week.is_active}
-                    onChange={(e) => {
-                      const checked = e.target.checked;
-                      setWeeks((cur) => cur.map((w) => ({ ...w, is_active: w.id === week.id ? checked : w.is_active })));
-                      if (checked) setActiveWeek(week);
-                    }} />
-                  发布此周
-                </label>
-              </div>
-              {!week.id.startsWith("draft-") ? (
-                <div className="link-row">
-                  <span className="link-url">{typeof window !== "undefined" ? `${window.location.origin}/week/${week.id}` : `/week/${week.id}`}</span>
-                  <button className="btn-ghost btn-sm" type="button"
-                    onClick={() => { void navigator.clipboard.writeText(`${window.location.origin}/week/${week.id}`); setMessage("链接已复制"); }}>
-                    复制链接
-                  </button>
-                  <button className="btn-ghost btn-sm" type="button" onClick={() => setActiveWeek(week)}>查看总览</button>
-                </div>
-              ) : null}
-              <div className="card-actions-row">
-                <button className="btn-primary btn-sm" type="button" disabled={savingWeekId === week.id} onClick={() => saveWeek(week)}>保存</button>
-                <button className="btn-ghost btn-sm" type="button" disabled={savingWeekId === week.id} onClick={() => deleteWeek(week.id)}>删除</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* XLS 导入 */}
-      {activeWeek ? (
-        <section className="admin-section">
-          <div className="section-header">
-            <div>
-              <h2>XLS 导入排班</h2>
-              <p>当前周：{formatWeekRange(activeWeek.start_date, activeWeek.end_date)}</p>
-            </div>
-          </div>
-
-          {!previewData ? (
-            <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap" }}>
-              <input ref={fileInputRef} type="file" accept=".xls,.xlsx" style={{ display: "none" }} onChange={handleFileUpload} />
-              <button className="btn-primary" type="button" onClick={() => fileInputRef.current?.click()} disabled={importing}>
-                选择 XLS 文件
-              </button>
-              <button className="btn-ghost btn-sm" type="button" onClick={clearSchedules} style={{ background: "var(--surface-muted)", color: "var(--text-muted)" }}>
-                清空排班
-              </button>
-              {activeWeek && slots.length > 0 && weekRiders.length === 0 ? (
-                <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>已有时段但无排班数据，可导入 XLS</span>
-              ) : null}
-              {activeWeek && slots.length === 0 ? (
-                <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>尚未导入，请选择文件</span>
-              ) : null}
-            </div>
-          ) : (
-            <div style={{ background: "var(--surface-muted)", borderRadius: "12px", padding: "16px" }}>
-              <p style={{ margin: "0 0 12px", fontWeight: 600 }}>导入预览</p>
-              <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "4px 16px", fontSize: "14px", marginBottom: "12px" }}>
-                <span style={{ color: "var(--text-muted)" }}>时段：</span><span>{previewData.slots.map((s) => s.name).join("、")}</span>
-                <span style={{ color: "var(--text-muted)" }}>骑手：</span><span>{new Set(previewData.entries.map((e) => e.riderId)).size} 人</span>
-                <span style={{ color: "var(--text-muted)" }}>记录：</span><span>{previewData.entries.length} 条</span>
-              </div>
-              <div style={{ display: "flex", gap: "8px" }}>
-                <button className="btn-primary" type="button" onClick={confirmImport} disabled={importing}>
-                  {importing ? "导入中..." : "确认导入"}
-                </button>
-                <button className="btn-ghost btn-sm" type="button" onClick={() => setPreviewData(null)} style={{ background: "var(--surface-muted)", color: "var(--text-muted)" }}>
-                  取消
-                </button>
-              </div>
-            </div>
-          )}
-        </section>
-      ) : null}
-
-      {/* 时段配置 */}
-      {activeWeek && slots.length > 0 ? (
-        <section className="admin-section">
-          <div className="section-header">
-            <div>
-              <h2>时段配置</h2>
-              <p>标记「可选」的时段骑手可在端上自由选择</p>
-            </div>
-          </div>
+        {loadingWeeks ? (
+          <div className="empty-state">加载中...</div>
+        ) : (
           <div className="config-grid">
-            {slots.map((slot) => (
-              <div className="config-card" key={slot.id} style={{ flexDirection: "row", alignItems: "center" }}>
-                <div style={{ flex: 1 }}>
-                  <strong>{slot.name}</strong>
-                  <span style={{ fontSize: "12px", color: "var(--text-muted)", display: "block" }}>{slot.start_time.slice(0, 5)}-{slot.end_time.slice(0, 5)}</span>
+            {weeks.map((week) => (
+              <div
+                className={`config-card ${activeWeek?.id === week.id ? "active-card" : ""}`}
+                key={week.id}
+                style={{ position: "relative", cursor: "pointer" }}
+                onClick={(e) => {
+                  if (!(e.target as HTMLElement).closest("button") && !(e.target as HTMLElement).closest("input")) {
+                    setActiveWeek(week);
+                  }
+                }}
+              >
+                <button
+                  className="btn-ghost"
+                  type="button"
+                  style={{ position: "absolute", top: "12px", right: "12px", padding: "4px 8px", color: "#ef4444", fontSize: "12px" }}
+                  disabled={savingWeekId === week.id}
+                  onClick={(e) => { e.stopPropagation(); setShowDeleteConfirm(week.id); }}
+                >
+                  删除
+                </button>
+                <div className="input-group" style={{ paddingRight: "32px" }}>
+                  <strong style={{ fontSize: "16px" }}>{week.name || formatWeekRange(week.start_date, week.end_date)}</strong>
+                  <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>
+                    {week.start_date} ~ {week.end_date}
+                  </span>
                 </div>
-                <label className="switch-label" style={{ cursor: "pointer" }}>
-                  <input type="checkbox" checked={slot.is_selectable} onChange={() => toggleSlotSelectable(slot.id)} />
-                  可选
-                </label>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" }}>
+                  <span style={{ fontSize: "12px", color: "var(--text-muted)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {typeof window !== "undefined" ? `${window.location.origin}/week/${week.id}` : `/week/${week.id}`}
+                  </span>
+                  <button
+                    className="btn-ghost"
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); void navigator.clipboard.writeText(`${window.location.origin}/week/${week.id}`); setMessage("链接已复制"); }}
+                    style={{ padding: "4px 8px", border: "1px solid var(--border-color)", fontSize: "12px", color: "var(--text-muted)" }}
+                    title="复制"
+                  >
+                    复制
+                  </button>
+                </div>
+                <div className="card-actions-row">
+                  <button
+                    className="btn-primary btn-sm"
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); router.push(`/admin/${week.id}`); }}
+                  >
+                    编辑配置
+                  </button>
+                  <button
+                    className="btn-ghost btn-sm"
+                    type="button"
+                    disabled={exportingWeekId === week.id}
+                    onClick={(e) => { e.stopPropagation(); void handleXlsExport(week); }}
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    {exportingWeekId === week.id ? "导出中..." : "导出XLS"}
+                  </button>
+                  <button
+                    className="btn-ghost btn-sm"
+                    type="button"
+                    disabled={importingWeekId === week.id}
+                    onClick={(e) => { e.stopPropagation(); fileInputRefs.current[week.id]?.click(); }}
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    {importingWeekId === week.id ? "导入中..." : "导入XLS"}
+                  </button>
+                </div>
+                <input
+                  ref={(el) => { fileInputRefs.current[week.id] = el; }}
+                  type="file"
+                  accept=".xls,.xlsx"
+                  style={{ display: "none" }}
+                  onChange={(e) => handleXlsImport(week.id, e)}
+                />
               </div>
             ))}
           </div>
-        </section>
-      ) : null}
-
-      {/* 每周必须选时段数 */}
-      {activeWeek && slots.length > 0 ? (
-        <section className="admin-section">
-          <div className="section-header">
-            <div>
-              <h2>排班要求</h2>
-              <p>规定每人每天必须选几个时段</p>
-            </div>
-          </div>
-          <div className="config-card" style={{ flexDirection: "row", alignItems: "center", maxWidth: "400px" }}>
-            <div style={{ flex: 1 }}>
-              <strong>每人每天必须选</strong>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <input className="clean-input" type="number" min={0} max={10} value={activeWeek.required_slots ?? 3}
-                onChange={(e) => setActiveWeek((cur) => cur ? { ...cur, required_slots: Number(e.target.value) } : null)}
-                onBlur={() => setWeekRequiredSlots(activeWeek.id, activeWeek.required_slots ?? 3)}
-                style={{ width: "60px", padding: "6px", textAlign: "center" }} />
-              <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>个时段</span>
-            </div>
-          </div>
-        </section>
-      ) : null}
+        )}
+      </section>
 
       {/* 排班总览 */}
       {activeWeek ? (
@@ -509,43 +491,71 @@ export default function AdminPage() {
         </section>
       ) : null}
 
-      {/* 每日休息名额 */}
-      {activeWeek && weekDays.length > 0 ? (
-        <section className="admin-section">
-          <div className="section-header">
-            <div>
-              <h2>每日休息名额配额</h2>
-              <p>排班率 = (总人数 − 已排休人数) / 总人数</p>
+      {/* 删除确认弹窗 */}
+      {showDeleteConfirm && (
+        <div className="overlay" onClick={() => setShowDeleteConfirm(null)}>
+          <div className="confirm-card" onClick={(e) => e.stopPropagation()}>
+            <h2>确认删除</h2>
+            <p style={{ margin: "0 0 20px 0", color: "var(--text-muted)" }}>删除后将无法恢复，确定要删除这个排班周吗？</p>
+            <div className="card-actions-row">
+              <button className="btn-ghost" type="button" onClick={() => setShowDeleteConfirm(null)}>取消</button>
+              <button
+                className="btn-primary"
+                type="button"
+                style={{ backgroundColor: "#ef4444" }}
+                onClick={() => deleteWeek(showDeleteConfirm)}
+                disabled={savingWeekId === showDeleteConfirm}
+              >
+                {savingWeekId === showDeleteConfirm ? "删除中..." : "确认删除"}
+              </button>
             </div>
           </div>
-          <div className="config-grid">
-            {weekDays.map((day) => {
-              const usedRest = schedules.filter((s) => s.work_date === day.key && s.slot_id === null).length;
-              const maxSlots = limits[day.key] ?? getDefaultLimit(day.key);
-              const total = weekRiders.length;
-              const ratio = total > 0 ? ((total - usedRest) / total * 100).toFixed(0) + "%" : "-";
-              return (
-                <div className="config-card" key={day.key} style={{ flexDirection: "row", alignItems: "center" }}>
-                  <div style={{ flex: 1 }}>
-                    <strong>{day.weekdayLabel}</strong>
-                    <span style={{ fontSize: "12px", color: "var(--text-muted)", display: "block" }}>{day.shortDate} · 已休 {usedRest}人 · 总 {total}人 · 排班率 {ratio}</span>
-                  </div>
-                  <div style={{ width: "80px" }}>
-                    <input className="clean-input" type="number" min={0} max={50} value={maxSlots}
-                      onChange={(e) => setLimits((cur) => ({ ...cur, [day.key]: Number(e.target.value) }))}
-                      style={{ padding: "8px", textAlign: "center" }} />
-                  </div>
-                </div>
-              );
-            })}
+        </div>
+      )}
+
+      {/* 创建周弹窗 */}
+      {showCreateModal && (
+        <div className="overlay" onClick={() => setShowCreateModal(false)}>
+          <div className="confirm-card" onClick={(e) => e.stopPropagation()}>
+            <h2>创建排班周</h2>
+            <div className="input-group">
+              <label>排班名称</label>
+              <input
+                className="clean-input"
+                type="text"
+                value={newWeekName}
+                onChange={(e) => setNewWeekName(e.target.value)}
+                placeholder="例如：第一周、A队排班等"
+                autoFocus
+              />
+            </div>
+            <div className="input-group">
+              <label>开始日期</label>
+              <input
+                className="clean-input"
+                type="date"
+                value={newWeekStart}
+                onChange={(e) => setNewWeekStart(e.target.value)}
+              />
+            </div>
+            <div className="input-group">
+              <label>结束日期</label>
+              <input
+                className="clean-input"
+                type="date"
+                value={newWeekEnd}
+                onChange={(e) => setNewWeekEnd(e.target.value)}
+              />
+            </div>
+            <div className="card-actions-row" style={{ marginTop: "16px" }}>
+              <button className="btn-ghost" type="button" onClick={() => setShowCreateModal(false)}>取消</button>
+              <button className="btn-primary" type="button" onClick={handleCreateWeek} disabled={creating}>
+                {creating ? "创建中..." : "创建"}
+              </button>
+            </div>
           </div>
-          <div style={{ marginTop: "16px", display: "flex", justifyContent: "flex-end" }}>
-            <button className="btn-primary" type="button" disabled={savingAll} onClick={saveAllLimits}>
-              {savingAll ? "保存中..." : "保存"}
-            </button>
-          </div>
-        </section>
-      ) : null}
+        </div>
+      )}
     </main>
   );
 }

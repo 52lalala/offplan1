@@ -3,6 +3,7 @@ export type ScheduleWeekRow = {
   start_date: string;
   end_date: string;
   is_active: boolean;
+  required_slots: number;
 };
 
 export type TimeSlotRow = {
@@ -22,7 +23,6 @@ export type RiderRow = {
   group_id: string;
   group_name: string;
   rider_type: string;
-  min_slots: number;
   is_active: boolean;
 };
 

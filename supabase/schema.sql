@@ -26,6 +26,7 @@ create table public.schedule_weeks (
   start_date date not null,
   end_date date not null,
   is_active boolean not null default false,
+  required_slots int not null default 3 check (required_slots >= 0 and required_slots <= 10),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (end_date >= start_date)
@@ -52,7 +53,6 @@ create table public.riders (
   group_id text not null default '',
   group_name text not null default '',
   rider_type text not null default '',
-  min_slots integer not null default 1 check (min_slots >= 0 and min_slots <= 10),
   is_active boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -109,6 +109,7 @@ end;
 $$;
 
 -- 批量导入 XLS 数据（事务内完成）
+-- 仅导入骑手和时段结构，不清除骑手已有排班选择
 -- p_data jsonb 格式：
 -- {
 --   "weekStart": "2026-06-01",
@@ -124,31 +125,22 @@ create or replace function public.import_xls_week(p_week_id uuid, p_data jsonb)
 returns jsonb language plpgsql
 as $$
 declare
-  v_week_start date;
-  v_week_end date;
   v_group_id text;
   v_group_name text;
   v_slot jsonb;
-  v_slot_ids uuid[];
   v_entry jsonb;
-  v_selections jsonb;
-  v_idx int;
   v_rider_id text;
   v_rider_name text;
-  v_date text;
-  v_all_zero boolean;
 begin
-  -- 解析基本信息
-  v_week_start := (p_data->>'weekStart')::date;
-  v_week_end := (p_data->>'weekEnd')::date;
   v_group_id := p_data->'group'->>'id';
   v_group_name := p_data->'group'->>'name';
 
-  -- 清空该周旧数据
+  -- 清空该周旧排班数据
   delete from public.rider_schedules where week_id = p_week_id;
+
+  -- 清空旧时段并重建
   delete from public.time_slots where week_id = p_week_id;
 
-  -- 创建时段
   for v_slot in select * from jsonb_array_elements(p_data->'slots')
   loop
     insert into public.time_slots (week_id, name, start_time, end_time, sort_order, is_selectable)
@@ -162,46 +154,23 @@ begin
     );
   end loop;
 
-  -- 导入排班条目
+  -- 仅导入骑手名单，不导入排班选择
   for v_entry in select * from jsonb_array_elements(p_data->'entries')
   loop
     v_rider_id := v_entry->>'riderId';
     v_rider_name := v_entry->>'riderName';
-    v_date := v_entry->>'date';
-    v_selections := v_entry->'selections';
 
-    -- 骑手 upsert
-    insert into public.riders (rider_id, name, group_id, group_name)
-    values (v_rider_id, v_rider_name, v_group_id, v_group_name)
-    on conflict (rider_id) do update set
-      name = v_rider_name,
-      group_id = v_group_id,
-      group_name = v_group_name;
-
-    -- 逐时段插入
-    v_all_zero := true;
-    for v_idx in 0 .. jsonb_array_length(v_selections) - 1
-    loop
-      if (v_selections->>v_idx)::int = 1 then
-        v_all_zero := false;
-        insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
-        select v_rider_id, p_week_id, v_date::date, ts.id, true
-        from public.time_slots ts
-        where ts.week_id = p_week_id
-        order by ts.sort_order
-        limit 1 offset v_idx;
-      end if;
-    end loop;
-
-    -- 全0 => 排休
-    if v_all_zero then
-      insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
-      values (v_rider_id, p_week_id, v_date::date, null, null)
-      on conflict (rider_id, work_date) where slot_id is null do nothing;
+    if v_rider_id is not null and v_rider_name is not null then
+      insert into public.riders (rider_id, name, group_id, group_name)
+      values (v_rider_id, v_rider_name, v_group_id, v_group_name)
+      on conflict (rider_id) do update set
+        name = v_rider_name,
+        group_id = v_group_id,
+        group_name = v_group_name;
     end if;
   end loop;
 
-  return jsonb_build_object('success', true, 'message', '导入完成');
+  return jsonb_build_object('success', true, 'message', '导入完成（仅骑手名单和时段，员工需重新选择排班）');
 end;
 $$;
 
@@ -221,13 +190,16 @@ returns jsonb language plpgsql
 as $$
 declare
   v_result jsonb;
+  v_required_slots int;
 begin
+  select required_slots into v_required_slots from public.schedule_weeks where id = p_week_id;
+
   select jsonb_agg(jsonb_build_object(
     'riderId', r.rider_id,
     'name', r.name,
     'groupId', r.group_id,
     'groupName', r.group_name,
-    'minSlots', r.min_slots
+    'requiredSlots', v_required_slots
   ) order by r.name)
   into v_result
   from public.riders r
@@ -276,12 +248,12 @@ begin
 end;
 $$;
 
--- 管理员设置骑手最少时段数
-create or replace function public.set_rider_min_slots(p_rider_id text, p_min_slots int)
+-- 管理员设置每周必须选时段数
+create or replace function public.set_week_required_slots(p_week_id uuid, p_required_slots int)
 returns jsonb language plpgsql
 as $$
 begin
-  update public.riders set min_slots = p_min_slots where rider_id = p_rider_id;
+  update public.schedule_weeks set required_slots = p_required_slots where id = p_week_id;
   return jsonb_build_object('success', true);
 end;
 $$;
@@ -534,7 +506,7 @@ grant execute on function public.clear_week_schedules to anon, authenticated;
 grant execute on function public.get_week_riders to anon, authenticated;
 grant execute on function public.get_week_slots to anon, authenticated;
 grant execute on function public.toggle_slot_selectable to anon, authenticated;
-grant execute on function public.set_rider_min_slots to anon, authenticated;
+grant execute on function public.set_week_required_slots to anon, authenticated;
 grant execute on function public.toggle_rider_slot to anon, authenticated;
 grant execute on function public.set_rider_rest to anon, authenticated;
 grant execute on function public.cancel_rider_rest to anon, authenticated;

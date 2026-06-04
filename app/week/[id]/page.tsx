@@ -47,12 +47,18 @@ export default function WeekSchedulePage() {
 
   const selectableSlots = useMemo(() => allSlots.filter((s) => s.is_selectable), [allSlots]);
   const selectableSlotIds = useMemo(() => new Set(selectableSlots.map((s) => s.id)), [selectableSlots]);
-  const riderMinSlots = rider?.min_slots ?? 1;
+  const requiredSlots = week?.required_slots ?? 3;
 
   const weekDays = useMemo(() => {
     if (!week) return [];
     return buildDaysFromRange(week.start_date, week.end_date);
   }, [week]);
+
+  const currentRestDays = useMemo(() => {
+    return schedules.filter((s) => s.slot_id === null).map((s) => s.work_date);
+  }, [schedules]);
+
+  const hasRestDay = currentRestDays.length > 0;
 
   const dayCards = useMemo<DayCard[]>(() => {
     return weekDays.map((day) => {
@@ -197,7 +203,7 @@ export default function WeekSchedulePage() {
       return;
     }
 
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ rider_id: data.rider_id, name: data.name, min_slots: data.min_slots }));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ rider_id: data.rider_id, name: data.name }));
     setRider(data);
     setShowNameGate(false);
     setSubmittingKey(null);
@@ -208,6 +214,17 @@ export default function WeekSchedulePage() {
     if (!week || !rider) return;
     const key = `${workDate}-${slotId}`;
     if (submittingKey === key) return;
+    
+    // Check if trying to select more than required slots
+    const daySchedule = schedules.filter((s) => s.work_date === workDate);
+    const currentSelected = daySchedule.filter((s) => s.is_selected === true && s.slot_id !== null).map((s) => s.slot_id!);
+    const isAlreadySelected = currentSelected.includes(slotId);
+    
+    if (!isAlreadySelected && requiredSlots > 0 && currentSelected.length >= requiredSlots) {
+      setMessage(`每天只能选择 ${requiredSlots} 个时段`);
+      return;
+    }
+    
     setSubmittingKey(key);
     setMessage(null);
 
@@ -224,6 +241,14 @@ export default function WeekSchedulePage() {
 
   async function confirmSetRest() {
     if (!week || !rider || !pendingRestDay) return;
+    
+    // Check if user already has a rest day
+    if (hasRestDay && !currentRestDays.includes(pendingRestDay.date)) {
+      setMessage("每周只能选择一天排休");
+      setPendingRestDay(null);
+      return;
+    }
+    
     setSubmittingKey("rest-" + pendingRestDay.date);
     setMessage(null);
 
@@ -303,7 +328,7 @@ export default function WeekSchedulePage() {
 
       <header className="page-header">
         <h1>{rider ? `Hi, ${rider.name}` : "排班系统"}</h1>
-        <p>{`${formatWeekRange(week.start_date, week.end_date)}`}</p>
+        <p>{`${formatWeekRange(week.start_date, week.end_date)} · 已选排休 ${currentRestDays.length}/1 天`}</p>
       </header>
 
       {message ? <div className="toast-pill">{message}</div> : null}
@@ -313,7 +338,7 @@ export default function WeekSchedulePage() {
           {dayCards.map((day) => {
             const remaining = (limits[day.date] ?? getDefaultLimit(day.date)) - (allRestCounts[day.date] ?? 0);
             const isRestFull = remaining <= 0 && !day.isRest;
-            const canSelectEnough = riderMinSlots === 0 || day.selectedCount >= riderMinSlots;
+            const canSelectEnough = requiredSlots === 0 || day.selectedCount === requiredSlots;
 
             return (
               <article className={`day-card ${day.isWeekend ? "weekend" : ""}`} key={day.date}>
@@ -338,7 +363,7 @@ export default function WeekSchedulePage() {
                   ) : (
                     <>
                       <div style={{ fontSize: "13px", color: "var(--text-muted)", marginBottom: "8px", textAlign: "center" }}>
-                        已选 {day.selectedCount} / 至少 {riderMinSlots} 个时段
+                         已选 {day.selectedCount} / 必须选 {requiredSlots} 个时段
                         {!canSelectEnough ? <span style={{ color: "var(--danger-color)", marginLeft: "6px" }}>不足！</span> : null}
                       </div>
 
@@ -364,9 +389,9 @@ export default function WeekSchedulePage() {
                       )}
 
                       <button className="btn-rest" type="button"
-                        disabled={isRestFull || submittingKey !== null}
+                        disabled={isRestFull || (hasRestDay && !day.isRest) || submittingKey !== null}
                         onClick={() => setPendingRestDay(day)}>
-                        {isRestFull ? "排休人数已满" : "申请排休"}
+                        {isRestFull ? "排休人数已满" : (hasRestDay && !day.isRest) ? "已选排休" : "申请排休"}
                       </button>
                     </>
                   )}

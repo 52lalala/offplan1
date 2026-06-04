@@ -1,17 +1,18 @@
 :root {
-  --bg-color: #f2f2f7;
+  --bg-color: #f8fafc;
   --card-bg: #ffffff;
-  --text-main: #111827;
-  --text-muted: #6b7280;
-  --border-color: #e5e7eb;
-  --accent-color: #4b7bec;
-  --accent-hover: #3d65d6;
+  --text-main: #0f172a;
+  --text-muted: #64748b;
+  --border-color: #e2e8f0;
+  --accent-color: #6366f1;
+  --accent-hover: #4f46e5;
   --danger-color: #ef4444;
-  --success-color: #10b981;
-  --surface-muted: #f3f4f6;
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-  --shadow-modal: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  --success-color: #22c55e;
+  --surface-muted: #f1f5f9;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+  --shadow-modal: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
 }
 
 * {
@@ -70,17 +71,18 @@ select {
   background: var(--card-bg);
   box-shadow: var(--shadow-modal);
   text-align: center;
+  border: 1px solid var(--border-color);
 }
 
 .welcome-card {
   max-width: 400px;
-  padding: 36px 28px;
+  padding: 40px 32px;
   border-radius: 28px;
 }
 
 .confirm-card {
-  max-width: 360px;
-  padding: 28px 22px 22px;
+  max-width: 380px;
+  padding: 32px 28px 24px;
   border-radius: 24px;
 }
 
@@ -142,18 +144,19 @@ select {
 .clean-input {
   width: 100%;
   padding: 16px;
-  border: 1px solid var(--border-color);
+  border: 1.5px solid var(--border-color);
   border-radius: 12px;
   font-size: 16px;
   background: var(--surface-muted);
-  transition: all 0.2s;
+  transition: all 0.2s ease;
   text-align: center;
 }
 
 .clean-input:focus {
   background: var(--card-bg);
   border-color: var(--accent-color);
-  box-shadow: 0 0 0 3px rgba(75, 123, 236, 0.1);
+  box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.12);
+  transform: scale(1.01);
 }
 
 .btn-primary,
@@ -177,11 +180,13 @@ select {
 .btn-primary {
   background: var(--accent-color);
   color: white;
+  box-shadow: 0 2px 4px rgba(99, 102, 241, 0.2);
 }
 
 .btn-primary:not(:disabled):hover {
   background: var(--accent-hover);
-  transform: scale(1.01);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(99, 102, 241, 0.3);
 }
 
 .btn-secondary {
@@ -208,22 +213,27 @@ select {
 }
 
 .page-header {
-  margin-bottom: 28px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 32px;
+  padding-bottom: 20px;
+  border-bottom: 2px solid var(--border-color);
 }
 
 .page-header h1 {
-  margin: 0 0 6px;
-  font-size: 28px;
-  font-weight: 700;
+  margin: 0 0 8px;
+  font-size: 32px;
+  font-weight: 800;
   letter-spacing: -0.5px;
+  background: linear-gradient(135deg, var(--text-main) 0%, var(--accent-color) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .page-header p {
   margin: 0;
-  font-size: 14px;
+  font-size: 15px;
   color: var(--text-muted);
+  font-weight: 500;
 }
 
 .toast-pill {
@@ -233,21 +243,22 @@ select {
   transform: translateX(-50%);
   z-index: 200;
   max-width: calc(100vw - 32px);
-  background: rgba(17, 24, 39, 0.92);
+  background: linear-gradient(135deg, var(--text-main) 0%, #1e293b 100%);
   color: white;
-  padding: 12px 24px;
+  padding: 14px 28px;
   border-radius: 999px;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
   text-align: center;
   backdrop-filter: blur(12px);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
-  animation: toast-in 0.25s ease;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+  animation: toast-in 0.3s ease;
+  border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 @keyframes toast-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
-  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+  from { opacity: 0; transform: translateX(-50%) translateY(16px) scale(0.95); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
 }
 
 .calendar-grid {
@@ -272,17 +283,22 @@ select {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  padding: 20px;
+  padding: 24px;
   background: var(--card-bg);
   border-radius: 20px;
   box-shadow: var(--shadow-sm);
   border: 1px solid var(--border-color);
-  transition: box-shadow 0.2s;
+  transition: all 0.2s ease;
+}
+
+.day-card:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
 }
 
 .day-card.weekend {
-  background: #f8f9fc;
-  border-color: #e2e4ed;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+  border-color: #cbd5e1;
 }
 
 .card-header {
@@ -311,17 +327,19 @@ select {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 4px 10px;
+  padding: 6px 12px;
   border-radius: 999px;
   background: var(--surface-muted);
   font-size: 12px;
   font-weight: 600;
   color: var(--text-main);
+  border: 1px solid var(--border-color);
 }
 
 .quota-pill.full {
-  background: #fee2e2;
-  color: #b91c1c;
+  background: #fef2f2;
+  color: #dc2626;
+  border-color: #fecaca;
 }
 
 .card-actions {
@@ -365,14 +383,15 @@ select {
 .segment-btn.active {
   background: var(--card-bg);
   color: var(--accent-color);
-  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.15);
   font-weight: 700;
+  transform: scale(1.02);
 }
 
 .btn-rest {
   width: 100%;
   padding: 14px;
-  background: var(--accent-color);
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
   color: white;
   border-radius: 12px;
   font-size: 15px;
@@ -380,12 +399,12 @@ select {
   border: none;
   transition: all 0.2s ease;
   letter-spacing: 0.03em;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
 }
 
 .btn-rest:not(:disabled):hover {
-  background: var(--accent-hover);
   transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(75, 123, 236, 0.3);
+  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.35);
 }
 
 .btn-rest:not(:disabled):active {
@@ -396,19 +415,24 @@ select {
   background: var(--surface-muted);
   color: var(--text-muted);
   box-shadow: none;
+  cursor: not-allowed;
 }
 
 .status-rested {
   width: 100%;
   padding: 14px;
-  background: linear-gradient(135deg, var(--text-main), #2d3748);
+  background: linear-gradient(135deg, var(--success-color) 0%, #16a34a 100%);
   color: white;
   border-radius: 12px;
   font-size: 15px;
   font-weight: 700;
   text-align: center;
   letter-spacing: 0.02em;
-  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.2);
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
 }
 
 .empty-state {
@@ -484,9 +508,10 @@ select {
 .admin-section {
   background: var(--card-bg);
   border-radius: 20px;
-  padding: 24px;
+  padding: 28px;
   margin-bottom: 24px;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-md);
+  border: 1px solid var(--border-color);
 }
 
 .section-header {
@@ -501,29 +526,35 @@ select {
 }
 
 .section-header h2 {
-  margin: 0 0 4px;
-  font-size: 20px;
+  margin: 0 0 6px;
+  font-size: 22px;
   color: var(--text-main);
+  font-weight: 700;
 }
 
 .section-header p {
   margin: 0;
   font-size: 14px;
   color: var(--text-muted);
+  font-weight: 500;
 }
 
 /* 幽灵按钮 (用于删除/次要操作) */
 .btn-ghost {
-  background: #FEE2E2;
-  color: #DC2626;
-  border: none;
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
   border-radius: 12px;
   padding: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.2s ease;
 }
-.btn-ghost:hover:not(:disabled) { background: #FECACA; }
+.btn-ghost:hover:not(:disabled) { 
+  background: #fee2e2; 
+  border-color: #fca5a5;
+  transform: translateY(-1px);
+}
 .btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btn-sm {
@@ -567,16 +598,22 @@ select {
 .config-card {
   border: 1px solid var(--border-color);
   border-radius: 16px;
-  padding: 16px;
+  padding: 18px;
   background: var(--surface-muted);
   display: flex;
   flex-direction: column;
   gap: 12px;
+  transition: all 0.2s ease;
+}
+
+.config-card:hover {
+  box-shadow: var(--shadow-md);
 }
 
 .config-card.active-card {
-  background: #F0F9FF; /* 激活状态给个极淡的蓝色背景 */
-  border-color: #BAE6FD;
+  background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
 }
 
 .card-actions-row {
@@ -643,17 +680,21 @@ select {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 4px 10px;
-  background: #EFF6FF;
-  color: #2563EB;
-  border-radius: 6px;
+  padding: 6px 12px;
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  color: #2563eb;
+  border-radius: 8px;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
+  border: 1px solid #bfdbfe;
+  box-shadow: 0 1px 2px rgba(37, 99, 235, 0.1);
 }
 
 .member-tag-pending {
-  background: #F3F4F6;
-  color: #9CA3AF;
+  background: #f1f5f9;
+  color: #64748b;
+  border-color: #e2e8f0;
+  box-shadow: 0 1px 2px rgba(100, 116, 139, 0.1);
 }
 
 
@@ -665,32 +706,36 @@ select {
 ========================================= */
 .table-wrapper {
   width: 100%;
-  overflow-x: auto; /* 核心：移动端允许左右滑动 */
+  overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   border: 1px solid var(--border-color);
-  border-radius: 12px;
+  border-radius: 16px;
   background: var(--card-bg);
+  box-shadow: var(--shadow-sm);
 }
 
 .admin-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 800px; /* 强制最小宽度，手机上自动出现横向滚动条 */
+  min-width: 800px;
   text-align: center;
 }
 
 .admin-table th, 
 .admin-table td {
-  padding: 14px 12px;
+  padding: 16px 14px;
   border-bottom: 1px solid var(--border-color);
   font-size: 14px;
 }
 
 .admin-table th {
-  background: #F9FAFB;
-  font-weight: 600;
-  color: var(--text-muted);
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+  font-weight: 700;
+  color: var(--text-main);
   white-space: nowrap;
+  text-transform: uppercase;
+  font-size: 12px;
+  letter-spacing: 0.05em;
 }
 
 /* 固定姓名列（左侧悬浮） */
@@ -711,23 +756,27 @@ select {
 /* 状态小标签 */
 .status-badge {
   display: inline-block;
-  padding: 4px 10px;
-  border-radius: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   white-space: nowrap;
+  border: 1px solid transparent;
 }
 .status-badge.rest {
-  background: #ECFDF5;
-  color: #059669; /* 休息用绿色 */
+  background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+  color: #059669;
+  border-color: #a7f3d0;
 }
 .status-badge.work {
-  background: #EFF6FF;
-  color: #2563EB; /* 上班用蓝色 */
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  color: #2563eb;
+  border-color: #bfdbfe;
 }
 .status-badge.missing {
-  background: #F3F4F6;
-  color: #9CA3AF; /* 未生成用灰色 */
+  background: #f1f5f9;
+  color: #64748b;
+  border-color: #e2e8f0;
 }
 
 /* 链接显示行 (多链接分享) */
@@ -815,21 +864,5 @@ select {
 /* 确保按钮在手机上点击不会闪烁 */
 .segment-btn {
   -webkit-tap-highlight-color: transparent;
-  outline: none; /* 移除默认外边框 */
-  /* ...保留你原本的其他样式... */
-}
-
-/* ★ 关键修复1：防止点击后残留变色状态 */
-.segment-btn:focus:not(:focus-visible) {
-  /* 当鼠标或手指点击时，不要应用系统默认的focus背景色 */
   outline: none;
-  background-color: transparent; /* 如果你有默认背景色，这里改成你的默认背景色 */
-}
-
-/* ★ 关键修复2：确保 active 状态的优先级最高，用 !important 强制覆盖 */
-.segment-btn.active {
-  background-color: #007bff !important; /* 改成你想要的选中背景色（比如蓝色） */
-  color: #ffffff !important;            /* 改成你想要的选中文字色 */
-  /* 可以加一点好看的阴影 */
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
 }

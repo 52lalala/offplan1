@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, useRef } from "react";
-import { buildDaysFromRange, formatWeekRange } from "@/lib/date";
+import { buildDaysFromRange, formatWeekRange, getWeekStart, formatDateKey } from "@/lib/date";
 import { supabase } from "@/lib/supabase";
 import { parseXlsFile } from "@/lib/xls";
 import type { ScheduleWeekRow, TimeSlotRow, RiderRow, RestDayLimitRow, RiderScheduleRow, XlsData } from "@/lib/types";
@@ -9,17 +9,26 @@ import type { ScheduleWeekRow, TimeSlotRow, RiderRow, RestDayLimitRow, RiderSche
 const DEFAULT_WEEKDAY_LIMIT = 5;
 const DEFAULT_WEEKEND_LIMIT = 2;
 
+function uid(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function getDefaultLimit(date: string) {
   const day = new Date(`${date}T00:00:00`).getDay();
   return day === 0 || day === 6 ? DEFAULT_WEEKEND_LIMIT : DEFAULT_WEEKDAY_LIMIT;
 }
 
 function createDraftWeek(): ScheduleWeekRow {
+  const monday = getWeekStart();
+  const sunday = new Date(monday);
+  sunday.setDate(sunday.getDate() + 6);
   return {
-    id: `draft-${crypto.randomUUID()}`,
-    start_date: "",
-    end_date: "",
+    id: `draft-${uid()}`,
+    start_date: formatDateKey(monday),
+    end_date: formatDateKey(sunday),
     is_active: false,
+    required_slots: 3,
   };
 }
 
@@ -48,9 +57,9 @@ export default function AdminPage() {
 
   const weekRiders = useMemo(() => {
     if (!activeWeek) return [];
-    const riderIds = new Set(schedules.map((s) => s.rider_id));
-    return Array.from(riderIds).map((id) => riderMap[id]).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
-  }, [activeWeek, schedules, riderMap]);
+    // 显示所有导入的骑手，而不仅仅是有排班数据的
+    return Object.values(riderMap).sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  }, [activeWeek, riderMap]);
 
   const slotMap = useMemo(() => {
     const map: Record<string, TimeSlotRow> = {};
@@ -189,6 +198,7 @@ export default function AdminPage() {
       start_date: week.start_date,
       end_date: week.end_date,
       is_active: week.is_active,
+      required_slots: week.required_slots ?? 3,
     };
     const { data, error } = await supabase.from("schedule_weeks").upsert(payload).select("id").single();
     if (error) { setSavingWeekId(null); setMessage(error.message); return; }
@@ -272,8 +282,8 @@ export default function AdminPage() {
     if (error) setMessage(error.message);
   }
 
-  async function setMinSlots(riderId: string, minSlots: number) {
-    const { error } = await supabase.rpc("set_rider_min_slots", { p_rider_id: riderId, p_min_slots: minSlots });
+  async function setWeekRequiredSlots(weekId: string, requiredSlots: number) {
+    const { error } = await supabase.rpc("set_week_required_slots", { p_week_id: weekId, p_required_slots: requiredSlots });
     if (error) setMessage(error.message);
   }
 
@@ -296,7 +306,7 @@ export default function AdminPage() {
     <main className="page-container">
       <header className="page-header">
         <h1>后台管理</h1>
-        <p>XLS 导入 · 骑手时段配置 · 排班总览</p>
+        <p>XLS 导入 · 骑手时段配置 · 排班总览 · 总骑手 {Object.keys(riderMap).length}</p>
       </header>
       {message ? <div className="toast-pill">{message}</div> : null}
 
@@ -419,32 +429,26 @@ export default function AdminPage() {
         </section>
       ) : null}
 
-      {/* 骑手管理 */}
-      {activeWeek && weekRiders.length > 0 ? (
+      {/* 每周必须选时段数 */}
+      {activeWeek && slots.length > 0 ? (
         <section className="admin-section">
           <div className="section-header">
             <div>
-              <h2>骑手管理</h2>
-              <p>设置每人每天最少选时段数（仅计算可选时段）</p>
+              <h2>排班要求</h2>
+              <p>规定每人每天必须选几个时段</p>
             </div>
           </div>
-          <div className="config-grid">
-            {weekRiders.map((rider) => (
-              <div className="config-card" key={rider.rider_id} style={{ flexDirection: "row", alignItems: "center" }}>
-                <div style={{ flex: 1 }}>
-                  <strong>{rider.name}</strong>
-                  <span style={{ fontSize: "12px", color: "var(--text-muted)", display: "block" }}>ID: {rider.rider_id}</span>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>最少选</span>
-                  <input className="clean-input" type="number" min={0} max={10} value={rider.min_slots}
-                    onChange={(e) => setRiderMap((cur) => ({ ...cur, [rider.rider_id]: { ...cur[rider.rider_id], min_slots: Number(e.target.value) } }))}
-                    onBlur={() => setMinSlots(rider.rider_id, rider.min_slots)}
-                    style={{ width: "60px", padding: "6px", textAlign: "center" }} />
-                  <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>个时段</span>
-                </div>
-              </div>
-            ))}
+          <div className="config-card" style={{ flexDirection: "row", alignItems: "center", maxWidth: "400px" }}>
+            <div style={{ flex: 1 }}>
+              <strong>每人每天必须选</strong>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <input className="clean-input" type="number" min={0} max={10} value={activeWeek.required_slots ?? 3}
+                onChange={(e) => setActiveWeek((cur) => cur ? { ...cur, required_slots: Number(e.target.value) } : null)}
+                onBlur={() => setWeekRequiredSlots(activeWeek.id, activeWeek.required_slots ?? 3)}
+                style={{ width: "60px", padding: "6px", textAlign: "center" }} />
+              <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>个时段</span>
+            </div>
           </div>
         </section>
       ) : null}
@@ -455,7 +459,7 @@ export default function AdminPage() {
           <div className="section-header">
             <div>
               <h2>排班总览</h2>
-              <p>{activeWeek ? formatWeekRange(activeWeek.start_date, activeWeek.end_date) : "未选择周"}</p>
+              <p>{activeWeek ? formatWeekRange(activeWeek.start_date, activeWeek.end_date) : "未选择周"} · 总人数 {weekRiders.length} · 已排班 {namesWithShifts.size}</p>
             </div>
           </div>
           {weekRiders.length > 0 ? (
@@ -469,10 +473,10 @@ export default function AdminPage() {
               </div>
               <label className="switch-label" style={{ marginBottom: "12px" }}>
                 <input type="checkbox" checked={showPendingOnly} onChange={(e) => setShowPendingOnly(e.target.checked)} />
-                仅显示未排班
+                仅显示未排班 ({weekRiders.filter((r) => !namesWithShifts.has(r.rider_id)).length}人)
               </label>
             </>
-          ) : <p style={{ fontSize: "14px", color: "var(--text-muted)" }}>暂无排班数据，请导入 XLS</p>}
+          ) : <p style={{ fontSize: "14px", color: "var(--text-muted)" }}>暂无骑手名单，请导入 XLS</p>}
 
           {requestSummaries.length > 0 ? (
             <div className="table-wrapper">

@@ -2,13 +2,12 @@ import * as XLSX from "xlsx";
 import type { XlsData, XlsSlotDef, XlsEntry } from "@/lib/types";
 
 function parseTimeRange(label: string): { startTime: string; endTime: string } {
-  const idx = label.indexOf("|");
-  if (idx === -1) return { startTime: "00:00", endTime: "00:00" };
-  const range = label.slice(idx + 1);
-  const parts = range.split("-");
+  const parts = label.split("|");
+  const range = parts[1] ?? "";
+  const times = range.split("-");
   return {
-    startTime: parts[0]?.trim() ?? "00:00",
-    endTime: parts[1]?.trim() ?? "00:00",
+    startTime: (times[0] ?? "").trim(),
+    endTime: (times[1] ?? "").replace(/\|.*$/, "").trim(),
   };
 }
 

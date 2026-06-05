@@ -336,12 +336,12 @@ export default function WeekSchedulePage() {
         <div className="confirm-overlay">
           <section className="confirm-card">
             <p className="confirm-eyebrow">确认排休</p>
-            <h3>{pendingRestDay.weekdayLabel} {pendingRestDay.shortDate}</h3>
+            <h3>{pendingRestDay.weekdayLabel} {pendingRestDay.shortDate} · 确定排休</h3>
             <p className="confirm-copy">确定后将设为排休，当前剩余 <strong>{Math.max(0, (limits[pendingRestDay.date] ?? getDefaultLimit(pendingRestDay.date)) - (allRestCounts[pendingRestDay.date] ?? 0))}</strong> 个排休空位。</p>
             <div className="confirm-actions">
               <button className="btn-secondary" type="button" onClick={() => setPendingRestDay(null)} disabled={submittingKey === "rest-" + pendingRestDay.date}>再想想</button>
               <button className="btn-primary" type="button" onClick={confirmSetRest} disabled={submittingKey === "rest-" + pendingRestDay.date}>
-                {submittingKey === "rest-" + pendingRestDay.date ? "提交中..." : "确定排休"}
+                {submittingKey === "rest-" + pendingRestDay.date ? "提交中..." : "确认"}
               </button>
             </div>
           </section>

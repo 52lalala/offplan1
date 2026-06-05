@@ -19,6 +19,7 @@ type DayCard = {
 };
 
 const STORAGE_KEY = "offplan.employeeInfo";
+const CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 const DEFAULT_WEEKDAY_LIMIT = 5;
 const DEFAULT_WEEKEND_LIMIT = 2;
 
@@ -106,9 +107,13 @@ export default function WeekSchedulePage() {
       const raw = window.localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (parsed?.name) {
+        const now = Date.now();
+        if (parsed?.name && (!parsed.timestamp || now - parsed.timestamp < CACHE_DURATION_MS)) {
           setDraftName(parsed.name);
           setRider(parsed);
+        } else {
+          window.localStorage.removeItem(STORAGE_KEY);
+          setShowNameGate(true);
         }
       }
     } catch {
@@ -215,7 +220,7 @@ export default function WeekSchedulePage() {
       return;
     }
 
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ rider_id: data.rider_id, name: data.name }));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ rider_id: data.rider_id, name: data.name, timestamp: Date.now() }));
     setRider(data);
     setShowNameGate(false);
     setSubmittingKey(null);

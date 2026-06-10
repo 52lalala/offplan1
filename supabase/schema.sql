@@ -29,6 +29,7 @@ create table public.schedule_weeks (
   end_date date not null,
   is_active boolean not null default false,
   required_slots int not null default 3 check (required_slots >= 0 and required_slots <= 10),
+  default_slot_ids uuid[] default null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (end_date >= start_date)
@@ -484,6 +485,55 @@ begin
 end;
 $$;
 
+-- 管理员设置默认时段
+create or replace function public.set_week_default_slots(p_week_id uuid, p_default_slot_ids uuid[])
+returns jsonb language plpgsql
+as $$
+begin
+  update public.schedule_weeks set default_slot_ids = p_default_slot_ids where id = p_week_id;
+  return jsonb_build_object('success', true);
+end;
+$$;
+
+-- 骑手切换时段（单时段模式：原子性地取消旧的并选择新的）
+create or replace function public.switch_rider_slot(
+  p_rider_id text,
+  p_week_id uuid,
+  p_work_date date,
+  p_old_slot_id uuid,
+  p_new_slot_id uuid
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_new_slot_selectable boolean;
+begin
+  -- 检查新时段是否可选
+  select is_selectable into v_new_slot_selectable
+  from public.time_slots where id = p_new_slot_id;
+
+  if not v_new_slot_selectable then
+    return jsonb_build_object('success', false, 'message', '该时段不可选');
+  end if;
+
+  -- 如果当天有排休记录，先删除
+  delete from public.rider_schedules
+  where rider_id = p_rider_id and work_date = p_work_date and slot_id is null;
+
+  -- 删除旧时段
+  delete from public.rider_schedules
+  where rider_id = p_rider_id and work_date = p_work_date and slot_id = p_old_slot_id;
+
+  -- 选择新时段
+  insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+  values (p_rider_id, p_week_id, p_work_date, p_new_slot_id, true)
+  on conflict (rider_id, work_date, slot_id) where slot_id is not null
+  do update set is_selected = true;
+
+  return jsonb_build_object('success', true, 'selected', true);
+end;
+$$;
+
 -- 骑手切换时段出勤状态
 create or replace function public.toggle_rider_slot(
   p_rider_id text,
@@ -496,6 +546,8 @@ as $$
 declare
   v_current boolean;
   v_slot_selectable boolean;
+  v_required_slots int;
+  v_current_selected_count int;
 begin
   -- 检查时段是否可选
   select is_selectable into v_slot_selectable
@@ -504,6 +556,10 @@ begin
   if not v_slot_selectable then
     return jsonb_build_object('success', false, 'message', '该时段不可选');
   end if;
+
+  -- 获取该周必须选时段数
+  select required_slots into v_required_slots
+  from public.schedule_weeks where id = p_week_id;
 
   -- 如果当天有排休记录，先删除
   delete from public.rider_schedules
@@ -520,6 +576,17 @@ begin
     where rider_id = p_rider_id and work_date = p_work_date and slot_id = p_slot_id;
     return jsonb_build_object('success', true, 'selected', false);
   else
+    -- 选择前检查是否已达到上限
+    if v_required_slots > 0 then
+      select count(*) into v_current_selected_count
+      from public.rider_schedules
+      where rider_id = p_rider_id and work_date = p_work_date and slot_id is not null and is_selected = true;
+
+      if v_current_selected_count >= v_required_slots then
+        return jsonb_build_object('success', false, 'message', '每天只能选择 ' || v_required_slots || ' 个时段');
+      end if;
+    end if;
+
     -- 选择
     insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
     values (p_rider_id, p_week_id, p_work_date, p_slot_id, true)
@@ -738,6 +805,8 @@ grant execute on function public.get_week_riders to anon, authenticated;
 grant execute on function public.get_week_slots to anon, authenticated;
 grant execute on function public.toggle_slot_selectable to anon, authenticated;
 grant execute on function public.set_week_required_slots to anon, authenticated;
+grant execute on function public.set_week_default_slots to anon, authenticated;
+grant execute on function public.switch_rider_slot to anon, authenticated;
 grant execute on function public.toggle_rider_slot to anon, authenticated;
 grant execute on function public.set_rider_rest to anon, authenticated;
 grant execute on function public.cancel_rider_rest to anon, authenticated;

@@ -82,6 +82,7 @@ export default function WeekEditPage() {
       end_date: week.end_date,
       is_active: week.is_active,
       required_slots: week.required_slots ?? 3,
+      default_slot_ids: week.default_slot_ids,
     }).eq("id", weekId);
     if (error) { setMessage(error.message); return; }
     setMessage("排休周已保存。");
@@ -94,6 +95,11 @@ export default function WeekEditPage() {
 
   async function setWeekRequiredSlots(requiredSlots: number) {
     const { error } = await supabase.rpc("set_week_required_slots", { p_week_id: weekId, p_required_slots: requiredSlots });
+    if (error) setMessage(error.message);
+  }
+
+  async function setWeekDefaultSlots(defaultSlotIds: string[]) {
+    const { error } = await supabase.rpc("set_week_default_slots", { p_week_id: weekId, p_default_slot_ids: defaultSlotIds });
     if (error) setMessage(error.message);
   }
 
@@ -222,6 +228,53 @@ export default function WeekEditPage() {
                 onBlur={() => setWeekRequiredSlots(week.required_slots ?? 3)}
                 style={{ width: "60px", padding: "6px", textAlign: "center" }} />
               <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>个时段</span>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {/* 默认时段选择 */}
+      {slots.length > 0 ? (
+        <section className="admin-section">
+          <div className="section-header">
+            <div>
+              <h2>默认时段选择</h2>
+              <p>设置员工自动选中的默认时段（仅从可选时段中选择）</p>
+            </div>
+          </div>
+          <div className="config-card" style={{ maxWidth: "600px" }}>
+            <div style={{ marginBottom: "12px", fontSize: "13px", color: "var(--text-muted)" }}>
+              已选 {week.default_slot_ids?.length ?? 0}/{week.required_slots ?? 3} 个默认时段
+            </div>
+            <div className="config-grid">
+              {slots.filter(s => s.is_selectable).map((slot) => {
+                const isSelected = week.default_slot_ids?.includes(slot.id) ?? false;
+                return (
+                  <div
+                    className={`config-card ${isSelected ? "active-card" : ""}`}
+                    key={slot.id}
+                    style={{ flexDirection: "row", alignItems: "center", cursor: "pointer" }}
+                    onClick={() => {
+                      const currentIds = week.default_slot_ids ?? [];
+                      const newIds = isSelected
+                        ? currentIds.filter(id => id !== slot.id)
+                        : [...currentIds, slot.id];
+                      setWeek((cur) => cur ? { ...cur, default_slot_ids: newIds } : null);
+                      void setWeekDefaultSlots(newIds);
+                    }}
+                  >
+                    <div style={{ flex: 1 }}>
+                      <strong>{slot.name}</strong>
+                      <span style={{ fontSize: "12px", color: "var(--text-muted)", display: "block" }}>
+                        {slot.start_time.slice(0, 5)}-{slot.end_time.slice(0, 5)}
+                      </span>
+                    </div>
+                    {isSelected && (
+                      <span style={{ color: "#10b981", fontSize: "18px" }}>✓</span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </section>

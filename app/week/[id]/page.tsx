@@ -225,6 +225,34 @@ export default function WeekSchedulePage() {
     setShowNameGate(false);
     setSubmittingKey(null);
     setMessage(`欢迎，${data.name}`);
+
+    // 自动应用默认时段
+    if (week?.default_slot_ids && week.default_slot_ids.length > 0) {
+      const defaultSlots = week.default_slot_ids;
+      const requiredSlots = week.required_slots ?? 3;
+      
+      if (defaultSlots.length === requiredSlots) {
+        // 默认时段数量匹配要求，自动应用
+        for (const day of weekDays) {
+          const daySchedule = schedules.filter((s) => s.work_date === day.key);
+          const hasRest = daySchedule.some((s) => s.slot_id === null);
+          
+          if (!hasRest) {
+            // 如果当天没有排休，应用默认时段
+            for (const slotId of defaultSlots) {
+              await supabase.rpc("toggle_rider_slot", {
+                p_rider_id: data.rider_id,
+                p_week_id: weekId,
+                p_work_date: day.key,
+                p_slot_id: slotId,
+              });
+            }
+          }
+        }
+        await refreshRiderSchedules();
+        setMessage(`欢迎，${data.name}（已自动应用默认时段）`);
+      }
+    }
   }
 
   async function handleToggleSlot(workDate: string, slotId: string) {
@@ -240,27 +268,16 @@ export default function WeekSchedulePage() {
         const [existingSlotId] = currentSelectedIds;
         setSubmittingKey(`slot-${workDate}`);
         setMessage(null);
-        const { error: deselectError } = await supabase.rpc("toggle_rider_slot", {
+        const { error } = await supabase.rpc("switch_rider_slot", {
           p_rider_id: rider.rider_id,
           p_week_id: week.id,
           p_work_date: workDate,
-          p_slot_id: existingSlotId,
-        });
-        if (deselectError) {
-          setSubmittingKey(null);
-          setMessage(deselectError.message);
-          await refreshRiderSchedules();
-          return;
-        }
-        const { error: selectError } = await supabase.rpc("toggle_rider_slot", {
-          p_rider_id: rider.rider_id,
-          p_week_id: week.id,
-          p_work_date: workDate,
-          p_slot_id: slotId,
+          p_old_slot_id: existingSlotId,
+          p_new_slot_id: slotId,
         });
         setSubmittingKey(null);
-        if (selectError) {
-          setMessage(selectError.message);
+        if (error) {
+          setMessage(error.message);
         }
         await refreshRiderSchedules();
         return;

@@ -32,6 +32,7 @@ function createDraftWeek(): ScheduleWeekRow {
     end_date: formatDateKey(sunday),
     is_active: false,
     required_slots: 3,
+    default_slot_ids: null,
   };
 }
 
@@ -78,6 +79,16 @@ export default function AdminPage() {
   const selectableSlotIds = useMemo(() => new Set(slots.filter((s) => s.is_selectable).map((s) => s.id)), [slots]);
 
   const namesWithShifts = useMemo(() => new Set(schedules.map((s) => s.rider_id)), [schedules]);
+
+  const restCounts = useMemo(() => {
+    const counts: Record<string, { used: number; limit: number }> = {};
+    for (const day of weekDays) {
+      const used = schedules.filter((s) => s.work_date === day.key && s.slot_id === null).length;
+      const limit = limits[day.key] ?? getDefaultLimit(day.key);
+      counts[day.key] = { used, limit };
+    }
+    return counts;
+  }, [schedules, weekDays, limits]);
 
   const requestSummaries = useMemo(() => {
     const grouped = new Map<string, RiderScheduleRow[]>();
@@ -157,7 +168,9 @@ export default function AdminPage() {
       const weeksRes = await supabase.from("schedule_weeks").select("*").order("start_date", { ascending: false });
       if (weeksRes.data) {
         setWeeks(weeksRes.data);
-        setActiveWeek(weeksRes.data.find((w) => w.is_active) ?? weeksRes.data[0] ?? null);
+        const savedWeekId = typeof window !== "undefined" ? localStorage.getItem("admin-selected-week-id") : null;
+        const savedWeek = savedWeekId ? weeksRes.data.find((w) => w.id === savedWeekId) : null;
+        setActiveWeek(savedWeek ?? weeksRes.data.find((w) => w.is_active) ?? weeksRes.data[0] ?? null);
       }
       setLoadingWeeks(false);
     }
@@ -238,6 +251,7 @@ export default function AdminPage() {
       end_date: week.end_date,
       is_active: week.is_active,
       required_slots: week.required_slots ?? 3,
+      default_slot_ids: week.default_slot_ids,
     };
     const { data, error } = await supabase.from("schedule_weeks").upsert(payload).select("id").single();
     if (error) { setSavingWeekId(null); setMessage(error.message); return; }
@@ -363,6 +377,7 @@ export default function AdminPage() {
                 onClick={(e) => {
                   if (!(e.target as HTMLElement).closest("button") && !(e.target as HTMLElement).closest("input")) {
                     setActiveWeek(week);
+                    localStorage.setItem("admin-selected-week-id", week.id);
                   }
                 }}
               >
@@ -466,9 +481,19 @@ export default function AdminPage() {
                 <thead>
                   <tr>
                     <th>骑手 ({requestSummaries.length}人)</th>
-                    {weekDays.map((day) => (
-                      <th key={day.key}>{day.weekdayLabel}<br /><span style={{ fontWeight: "normal", fontSize: "12px" }}>{day.shortDate}</span></th>
-                    ))}
+                    {weekDays.map((day) => {
+                      const rc = restCounts[day.key] ?? { used: 0, limit: 0 };
+                      const full = rc.used >= rc.limit;
+                      return (
+                        <th key={day.key}>
+                          {day.weekdayLabel}<br />
+                          <span style={{ fontWeight: "normal", fontSize: "12px" }}>{day.shortDate}</span><br />
+                          <span style={{ fontWeight: "normal", fontSize: "11px", color: full ? "#ef4444" : "var(--text-muted)" }}>
+                            休息日：{rc.used}/{rc.limit}
+                          </span>
+                        </th>
+                      );
+                    })}
                   </tr>
                 </thead>
                 <tbody>

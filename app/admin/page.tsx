@@ -239,14 +239,14 @@ export default function AdminPage() {
       items = items.filter((item) => riderMap[item.riderId]?.group_id === groupFilter);
     }
     if (showPendingOnly) {
-      items = items.filter((item) => !namesWithShifts.has(item.riderId));
+      items = items.filter((item) => (riderStatusMap[item.riderId]?.missingDays ?? 0) > 0);
     }
     if (quickFilter) {
       const filterIds = new Set(riderIdsByFilter[quickFilter]);
       items = items.filter((item) => filterIds.has(item.riderId));
     }
     return items;
-  }, [requestSummaries, searchText, groupFilter, showPendingOnly, quickFilter, riderIdsByFilter, riderMap, namesWithShifts]);
+  }, [requestSummaries, searchText, groupFilter, showPendingOnly, quickFilter, riderIdsByFilter, riderMap, riderStatusMap]);
 
   const applyQuickFilter = useCallback((filter: QuickFilterKey | null) => {
     setQuickFilter((prev) => {
@@ -638,9 +638,9 @@ export default function AdminPage() {
                 }}
               >
                 <button
-                  className="btn-ghost"
+                  className="btn-ghost btn-danger"
                   type="button"
-                  style={{ position: "absolute", top: "12px", right: "12px", padding: "4px 8px", color: "#ef4444", fontSize: "12px" }}
+                  style={{ position: "absolute", top: "12px", right: "12px", padding: "4px 8px", fontSize: "12px" }}
                   disabled={savingWeekId === week.id}
                   onClick={(e) => { e.stopPropagation(); setShowDeleteConfirm(week.id); }}
                 >
@@ -735,7 +735,15 @@ export default function AdminPage() {
                     <div>
                       <strong>{selectedRiderArray.length}</strong> / {filteredRequestSummaries.length} 已选
                     </div>
-                    {quickFilter ? <span className="chip chip-active" onClick={() => applyQuickFilter(quickFilter)}>{quickFilter === "noRest" ? "缺排休" : quickFilter === "incomplete" ? "时段不足" : "未生成"}</span> : null}
+                    {quickFilter ? (
+                      <button
+                        className="chip chip-active"
+                        type="button"
+                        onClick={() => applyQuickFilter(quickFilter)}
+                      >
+                        {quickFilter === "noRest" ? "缺排休" : quickFilter === "incomplete" ? "时段不足" : "未生成"}
+                      </button>
+                    ) : null}
                     <button className="btn-secondary btn-sm" type="button" onClick={resetSelection} disabled={selectedRiderArray.length === 0}>清除选择</button>
                   </div>
                   <div className="filter-chips">
@@ -744,22 +752,27 @@ export default function AdminPage() {
                       { key: "incomplete", label: "时段不足" },
                       { key: "untouched", label: "未生成" },
                     ] as { key: QuickFilterKey; label: string }[]).map(({ key, label }) => (
-                      <span
+                      <button
                         key={key}
                         className={`chip ${quickFilter === key ? "chip-active" : ""}`}
+                        type="button"
                         onClick={() => applyQuickFilter(key)}
                       >
                         {label}
                         <small style={{ opacity: 0.6 }}>（{riderIdsByFilter[key].length}）</small>
-                      </span>
+                      </button>
                     ))}
-                    <span
+                    <button
                       className={`chip ${showPendingOnly ? "chip-active" : ""}`}
+                      type="button"
                       onClick={() => setShowPendingOnly((prev) => !prev)}
                     >
-                      仅未排班
-                      <small style={{ opacity: 0.6 }}>（{weekRiders.filter((r) => !namesWithShifts.has(r.rider_id)).length}）</small>
-                    </span>
+                      未完成排班
+                      <small style={{ opacity: 0.6 }}>（{weekRiders.filter((r) => {
+                        const status = riderStatusMap[r.rider_id];
+                        return !status || status.missingDays > 0;
+                      }).length}）</small>
+                    </button>
                   </div>
                 </div>
 
@@ -800,13 +813,14 @@ export default function AdminPage() {
                     {selectableSlots.length > 0 && (
                       <div className="inline-input" style={{ flexWrap: "wrap" }}>
                         {selectableSlots.map((slot) => (
-                          <span
+                          <button
                             key={slot.id}
                             className={`chip ${applySlotId === slot.id ? "chip-active" : ""}`}
+                            type="button"
                             onClick={() => setApplySlotId(applySlotId === slot.id ? "" : slot.id)}
                           >
                             {slot.name}
-                          </span>
+                          </button>
                         ))}
                       </div>
                     )}
@@ -976,9 +990,8 @@ export default function AdminPage() {
             <div className="card-actions-row">
               <button className="btn-ghost" type="button" onClick={() => setShowDeleteConfirm(null)}>取消</button>
               <button
-                className="btn-primary"
+                className="btn-primary btn-danger"
                 type="button"
-                style={{ backgroundColor: "#ef4444" }}
                 onClick={() => deleteWeek(showDeleteConfirm)}
                 disabled={savingWeekId === showDeleteConfirm}
               >

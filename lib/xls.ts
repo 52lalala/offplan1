@@ -46,7 +46,7 @@ export function normalizeXlsDate(value: unknown): string {
   const digits = str.replace(/\D/g, "");
   if (digits.length === 8) return digits;
 
-  return str;
+  return "";
 }
 
 export function parseXlsFile(buffer: ArrayBuffer): XlsData {

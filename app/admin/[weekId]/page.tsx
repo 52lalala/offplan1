@@ -33,12 +33,14 @@ export default function WeekEditPage() {
   useEffect(() => {
     async function load() {
       setLoading(true);
-      const [weekRes, slotsRes, limitsRes] = await Promise.all([
-        supabase.from("schedule_weeks").select("*").eq("id", weekId).maybeSingle(),
+      const { data: weekData } = await supabase.from("schedule_weeks").select("*").eq("id", weekId).maybeSingle();
+      const [slotsRes, limitsRes] = await Promise.all([
         supabase.from("time_slots").select("*").eq("week_id", weekId).order("sort_order"),
-        supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", week?.start_date || ""),
+        weekData
+          ? supabase.from("rest_day_limits").select("rest_date,max_slots").eq("week_start", weekData.start_date)
+          : Promise.resolve({ data: [], error: null }),
       ]);
-      setWeek(weekRes.data ?? null);
+      setWeek(weekData ?? null);
       setSlots(slotsRes.data ?? []);
       if (limitsRes.data) {
         setLimits(limitsRes.data.reduce<Record<string, number>>((acc, r) => { acc[r.rest_date] = r.max_slots; return acc; }, {}));
@@ -78,6 +80,7 @@ export default function WeekEditPage() {
     if (!week?.start_date || !week?.end_date) { setMessage("请完整填写起止日期。"); return; }
     setMessage(null);
     const { error } = await supabase.from("schedule_weeks").update({
+      name: week.name,
       start_date: week.start_date,
       end_date: week.end_date,
       is_active: week.is_active,
@@ -94,6 +97,10 @@ export default function WeekEditPage() {
   }
 
   async function setWeekRequiredSlots(requiredSlots: number) {
+    if (!Number.isInteger(requiredSlots) || requiredSlots < 0 || requiredSlots > 10) {
+      setMessage("必选时段数需在 0 到 10 之间");
+      return;
+    }
     const { error } = await supabase.rpc("set_week_required_slots", { p_week_id: weekId, p_required_slots: requiredSlots });
     if (error) setMessage(error.message);
   }
@@ -224,8 +231,19 @@ export default function WeekEditPage() {
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <input className="clean-input" type="number" min={0} max={10} value={week.required_slots ?? 3}
-                onChange={(e) => setWeek((cur) => cur ? { ...cur, required_slots: Number(e.target.value) } : null)}
-                onBlur={() => setWeekRequiredSlots(week.required_slots ?? 3)}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setWeek((cur) => cur ? { ...cur, required_slots: value === "" ? 0 : Number(value) } : null);
+                }}
+                onBlur={(e) => {
+                  const value = Number(e.target.value);
+                  if (!Number.isInteger(value) || value < 0 || value > 10) {
+                    setWeek((cur) => cur ? { ...cur, required_slots: 3 } : null);
+                    setMessage("必选时段数需在 0 到 10 之间");
+                    return;
+                  }
+                  void setWeekRequiredSlots(value);
+                }}
                 style={{ width: "60px", padding: "6px", textAlign: "center" }} />
               <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>个时段</span>
             </div>
@@ -250,10 +268,10 @@ export default function WeekEditPage() {
               {slots.filter(s => s.is_selectable).map((slot) => {
                 const isSelected = week.default_slot_ids?.includes(slot.id) ?? false;
                 return (
-                  <div
-                    className={`config-card ${isSelected ? "active-card" : ""}`}
+                  <button
+                    className={`config-card ${isSelected ? "active-card" : ""} selectable-card`}
                     key={slot.id}
-                    style={{ flexDirection: "row", alignItems: "center", cursor: "pointer" }}
+                    type="button"
                     onClick={() => {
                       const currentIds = week.default_slot_ids ?? [];
                       const newIds = isSelected
@@ -263,16 +281,18 @@ export default function WeekEditPage() {
                       void setWeekDefaultSlots(newIds);
                     }}
                   >
-                    <div style={{ flex: 1 }}>
+                    <div style={{ flex: 1, textAlign: "left" }}>
                       <strong>{slot.name}</strong>
                       <span style={{ fontSize: "12px", color: "var(--text-muted)", display: "block" }}>
                         {slot.start_time.slice(0, 5)}-{slot.end_time.slice(0, 5)}
                       </span>
                     </div>
-                    {isSelected && (
-                      <span style={{ color: "#10b981", fontSize: "18px" }}>✓</span>
+                    {isSelected ? (
+                      <span className="selection-check" aria-hidden="true">✓</span>
+                    ) : (
+                      <span className="selection-hint">点击选择</span>
                     )}
-                  </div>
+                  </button>
                 );
               })}
             </div>

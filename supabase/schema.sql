@@ -191,7 +191,7 @@ begin
         group_id = v_group_id,
         group_name = v_group_name;
 
-      if v_slot_ids is not null then
+      if v_slot_ids is not null and coalesce(v_entry->>'date', '') ~ '^\d{8}$' then
         v_work_date := to_date(v_entry->>'date', 'YYYYMMDD');
         if v_work_date is not null then
           for v_slot_idx in 1..coalesce(array_length(v_slot_ids, 1), 0)

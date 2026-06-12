@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import * as XLSX from "xlsx";
 import { buildDaysFromRange, formatWeekRange, getWeekStart, formatDateKey } from "@/lib/date";
@@ -10,6 +10,23 @@ import type { ScheduleWeekRow, TimeSlotRow, RiderRow, RestDayLimitRow, RiderSche
 
 const DEFAULT_WEEKDAY_LIMIT = 5;
 const DEFAULT_WEEKEND_LIMIT = 2;
+
+type BulkActionType = "apply-default" | "apply-slot" | "set-rest" | "clear-rest" | "clear-schedules";
+type QuickFilterKey = "noRest" | "incomplete" | "untouched";
+type RiderStatus = {
+  hasRest: boolean;
+  missingDays: number;
+  totalSelected: number;
+  totalEntries: number;
+};
+
+function areStringSetsEqual(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const value of a) {
+    if (!b.has(value)) return false;
+  }
+  return true;
+}
 
 function uid(): string {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
@@ -47,8 +64,17 @@ export default function AdminPage() {
   const [limits, setLimits] = useState<Record<string, number>>({});
   const [message, setMessage] = useState<string | null>(null);
 
+  const [selectedRiderIds, setSelectedRiderIds] = useState<Set<string>>(() => new Set());
+  const [quickFilter, setQuickFilter] = useState<QuickFilterKey | null>(null);
+  const [bulkRestDate, setBulkRestDate] = useState("");
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [pendingAction, setPendingAction] = useState<BulkActionType | null>(null);
+
   const [savingWeekId, setSavingWeekId] = useState<string | null>(null);
   const [showPendingOnly, setShowPendingOnly] = useState(false);
+  const [applySlotId, setApplySlotId] = useState("");
+  const [searchText, setSearchText] = useState("");
+  const [groupFilter, setGroupFilter] = useState("");
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newWeekName, setNewWeekName] = useState("");
   const [newWeekStart, setNewWeekStart] = useState("");
@@ -57,6 +83,7 @@ export default function AdminPage() {
   const [importingWeekId, setImportingWeekId] = useState<string | null>(null);
   const [exportingWeekId, setExportingWeekId] = useState<string | null>(null);
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const masterSelectRef = useRef<HTMLInputElement | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
 
   const weekDays = useMemo(() => {
@@ -77,8 +104,59 @@ export default function AdminPage() {
   }, [slots]);
 
   const selectableSlotIds = useMemo(() => new Set(slots.filter((s) => s.is_selectable).map((s) => s.id)), [slots]);
+  const selectableSlots = useMemo(() => slots.filter((s) => s.is_selectable).sort((a, b) => a.sort_order - b.sort_order), [slots]);
 
   const namesWithShifts = useMemo(() => new Set(schedules.map((s) => s.rider_id)), [schedules]);
+
+  const scheduleByRider = useMemo(() => {
+    const map = new Map<string, Map<string, RiderScheduleRow[]>>();
+    for (const entry of schedules) {
+      const riderMap = map.get(entry.rider_id) ?? new Map<string, RiderScheduleRow[]>();
+      const dayList = riderMap.get(entry.work_date) ?? [];
+      dayList.push(entry);
+      riderMap.set(entry.work_date, dayList);
+      map.set(entry.rider_id, riderMap);
+    }
+    return map;
+  }, [schedules]);
+
+  const riderStatusMap = useMemo<Record<string, RiderStatus>>(() => {
+    const result: Record<string, RiderStatus> = {};
+    const dayKeys = weekDays.map((day) => day.key);
+    for (const rider of weekRiders) {
+      const riderDayMap = scheduleByRider.get(rider.rider_id);
+      let hasRest = false;
+      let missingDays = 0;
+      let totalSelected = 0;
+      for (const dayKey of dayKeys) {
+        const entries = riderDayMap?.get(dayKey) ?? [];
+        const restEntry = entries.find((item) => item.slot_id === null);
+        if (restEntry) hasRest = true;
+        const selectedCount = entries.filter((item) => item.slot_id !== null && item.is_selected).length;
+        totalSelected += selectedCount;
+        if (!restEntry && selectedCount === 0) {
+          missingDays += 1;
+        }
+      }
+      result[rider.rider_id] = {
+        hasRest,
+        missingDays,
+        totalSelected,
+        totalEntries: dayKeys.length,
+      };
+    }
+    return result;
+  }, [scheduleByRider, weekDays, weekRiders]);
+
+  const groups = useMemo(() => {
+    const groupMap = new Map<string, string>();
+    for (const rider of weekRiders) {
+      if (rider.group_id) {
+        groupMap.set(rider.group_id, rider.group_name || rider.group_id);
+      }
+    }
+    return Array.from(groupMap.entries()).map(([id, name]) => ({ id, name }));
+  }, [weekRiders]);
 
   const restCounts = useMemo(() => {
     const counts: Record<string, { used: number; limit: number }> = {};
@@ -91,16 +169,17 @@ export default function AdminPage() {
   }, [schedules, weekDays, limits]);
 
   const requestSummaries = useMemo(() => {
-    const grouped = new Map<string, RiderScheduleRow[]>();
+    const schedulesByRider = new Map<string, RiderScheduleRow[]>();
     for (const schedule of schedules) {
-      const list = grouped.get(schedule.rider_id) ?? [];
+      const list = schedulesByRider.get(schedule.rider_id) ?? [];
       list.push(schedule);
-      grouped.set(schedule.rider_id, list);
+      schedulesByRider.set(schedule.rider_id, list);
     }
 
-    return Array.from(grouped.entries())
-      .sort((a, b) => (riderMap[a[0]]?.name ?? "").localeCompare(riderMap[b[0]]?.name ?? "", "zh-CN"))
-      .map(([riderId, riderSchedules]) => {
+    return weekRiders
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+      .map((rider) => {
+        const riderSchedules = schedulesByRider.get(rider.rider_id) ?? [];
         const shiftsByDate = new Map<string, RiderScheduleRow[]>();
         for (const schedule of riderSchedules) {
           const list = shiftsByDate.get(schedule.work_date) ?? [];
@@ -124,9 +203,179 @@ export default function AdminPage() {
           return `${day.weekdayLabel} ${selectedSlots.join("、")}`;
         });
 
-        return { riderId, riderName: riderMap[riderId]?.name ?? riderId, dayTexts };
+        return { riderId: rider.rider_id, riderName: rider.name, dayTexts };
       });
-  }, [riderMap, schedules, slotMap, weekDays]);
+  }, [riderMap, schedules, slotMap, weekDays, weekRiders]);
+
+  const riderIdsByFilter = useMemo<Record<QuickFilterKey, string[]>>(() => {
+    const result: Record<QuickFilterKey, string[]> = {
+      noRest: [],
+      incomplete: [],
+      untouched: [],
+    };
+    for (const rider of weekRiders) {
+      const status = riderStatusMap[rider.rider_id];
+      if (!status) continue;
+      if (!status.hasRest) {
+        result.noRest.push(rider.rider_id);
+      }
+      if (status.missingDays > 0) {
+        result.incomplete.push(rider.rider_id);
+      }
+      if (status.totalSelected === 0 && !status.hasRest) {
+        result.untouched.push(rider.rider_id);
+      }
+    }
+    return result;
+  }, [weekRiders, riderStatusMap]);
+
+  const filteredRequestSummaries = useMemo(() => {
+    let items = requestSummaries;
+    if (searchText.trim()) {
+      const lower = searchText.toLowerCase();
+      items = items.filter((item) => item.riderName.toLowerCase().includes(lower));
+    }
+    if (groupFilter) {
+      items = items.filter((item) => riderMap[item.riderId]?.group_id === groupFilter);
+    }
+    if (showPendingOnly) {
+      items = items.filter((item) => !namesWithShifts.has(item.riderId));
+    }
+    if (quickFilter) {
+      const filterIds = new Set(riderIdsByFilter[quickFilter]);
+      items = items.filter((item) => filterIds.has(item.riderId));
+    }
+    return items;
+  }, [requestSummaries, searchText, groupFilter, showPendingOnly, quickFilter, riderIdsByFilter, riderMap, namesWithShifts]);
+
+  const applyQuickFilter = useCallback((filter: QuickFilterKey | null) => {
+    setQuickFilter((prev) => {
+      const nextFilter = prev === filter ? null : filter;
+      const targetIds = nextFilter ? riderIdsByFilter[nextFilter] : [];
+      setSelectedRiderIds(new Set(targetIds));
+      if (masterSelectRef.current) {
+        masterSelectRef.current.indeterminate = false;
+        masterSelectRef.current.checked = targetIds.length > 0;
+      }
+      return nextFilter;
+    });
+  }, [riderIdsByFilter]);
+
+  const toggleRiderSelection = useCallback((riderId: string) => {
+    setSelectedRiderIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(riderId)) {
+        next.delete(riderId);
+      } else {
+        next.add(riderId);
+      }
+      if (masterSelectRef.current) {
+        const totalRows = filteredRequestSummaries.length;
+        masterSelectRef.current.checked = next.size === totalRows && totalRows > 0;
+        masterSelectRef.current.indeterminate = next.size > 0 && next.size < totalRows;
+      }
+      return next;
+    });
+  }, [filteredRequestSummaries.length]);
+
+  const resetSelection = useCallback(() => {
+    setSelectedRiderIds(new Set());
+    setPendingAction(null);
+    if (masterSelectRef.current) {
+      masterSelectRef.current.checked = false;
+      masterSelectRef.current.indeterminate = false;
+    }
+  }, []);
+
+  const selectedRiderArray = useMemo(() => Array.from(selectedRiderIds), [selectedRiderIds]);
+
+  useEffect(() => {
+    if (!masterSelectRef.current) return;
+    const totalRows = filteredRequestSummaries.length;
+    masterSelectRef.current.checked = selectedRiderIds.size > 0 && selectedRiderIds.size === totalRows && totalRows > 0;
+    masterSelectRef.current.indeterminate = selectedRiderIds.size > 0 && selectedRiderIds.size < totalRows;
+  }, [filteredRequestSummaries.length, selectedRiderIds]);
+
+  const handleBulkAction = useCallback(async (action: BulkActionType) => {
+    if (!activeWeek) return;
+    const riderIds = Array.from(selectedRiderIds);
+    if (riderIds.length === 0) {
+      setMessage("请选择至少一位骑手");
+      return;
+    }
+    if (action === "set-rest" && !bulkRestDate) {
+      setMessage("请选择排休日期");
+      return;
+    }
+    setBulkLoading(true);
+    setMessage(null);
+    setPendingAction(action);
+    try {
+      let responseMessage = "操作已完成";
+      if (action === "apply-default") {
+        const { error, data } = await supabase.rpc("bulk_apply_default_slots", {
+          p_week_id: activeWeek.id,
+          p_rider_ids: riderIds,
+        });
+        if (error) throw error;
+        if (data?.processed !== undefined) {
+          responseMessage = `已套用默认时段（${data.processed}人）`;
+        }
+      } else if (action === "apply-slot") {
+        if (!applySlotId) { setMessage("请选择要套用的时段"); setBulkLoading(false); setPendingAction(null); return; }
+        const { error, data } = await supabase.rpc("bulk_apply_slot", {
+          p_week_id: activeWeek.id,
+          p_rider_ids: riderIds,
+          p_slot_id: applySlotId,
+        });
+        if (error) throw error;
+        const slotName = slotMap[applySlotId]?.name ?? "";
+        if (data?.processed !== undefined) {
+          responseMessage = `已套用「${slotName}」${data.processed} 条${data.skipped > 0 ? `，跳过 ${data.skipped} 个排休日` : ""}`;
+        }
+      } else if (action === "set-rest") {
+        const { error, data } = await supabase.rpc("bulk_set_rider_rest", {
+          p_week_id: activeWeek.id,
+          p_rider_ids: riderIds,
+          p_work_date: bulkRestDate,
+        });
+        if (error) throw error;
+        if (data?.failed?.length) {
+          const successCount = data.processed ?? (riderIds.length - data.failed.length);
+          responseMessage = `成功 ${successCount} 人，${data.failed.length} 人排休名额不足`;
+        } else {
+          responseMessage = `已安排排休（${data?.processed ?? riderIds.length}人）`;
+        }
+      } else if (action === "clear-rest") {
+        const { error, data } = await supabase.rpc("bulk_clear_rider_rest", {
+          p_week_id: activeWeek.id,
+          p_rider_ids: riderIds,
+          p_work_date: bulkRestDate || null,
+        });
+        if (error) throw error;
+        if (data?.removed !== undefined) {
+          responseMessage = `已取消排休 ${data.removed} 条`;
+        }
+      } else if (action === "clear-schedules") {
+        const { error, data } = await supabase.rpc("bulk_clear_rider_schedules", {
+          p_week_id: activeWeek.id,
+          p_rider_ids: riderIds,
+        });
+        if (error) throw error;
+        if (data?.removed !== undefined) {
+          responseMessage = `已清空排班 ${data.removed} 条`;
+        }
+      }
+      setMessage(responseMessage);
+      resetSelection();
+    } catch (err: unknown) {
+      setMessage(err instanceof Error ? err.message : "批量操作失败");
+    } finally {
+      setBulkLoading(false);
+      setPendingAction(null);
+      setBulkRestDate("");
+    }
+  }, [activeWeek, bulkRestDate, resetSelection, selectedRiderIds, applySlotId, slotMap]);
 
   async function handleXlsExport(week: ScheduleWeekRow) {
     setExportingWeekId(week.id);
@@ -145,8 +394,15 @@ export default function AdminPage() {
       const payload = data as ExportXlsData;
       const toArray = (value: unknown): (string | number | null)[] => (Array.isArray(value) ? value : []);
       const header = toArray(payload.header);
+      const slotColSet = new Set(payload.slotColumnIndexes.map((index) => Number(index)));
       const rows = (Array.isArray(payload.rows) ? payload.rows : []).map(toArray);
-      const aoa = [header, ...rows].map((row) => row.map((cell) => (cell ?? "")));
+      const aoa = [header, ...rows].map((row) =>
+        row.map((cell, ci) => {
+          if (cell == null) return "";
+          if (slotColSet.has(ci) && typeof cell === "string" && (cell === "0" || cell === "1")) return Number(cell);
+          return cell;
+        })
+      );
 
       const worksheet = XLSX.utils.aoa_to_sheet(aoa);
       const workbook = XLSX.utils.book_new();
@@ -462,26 +718,193 @@ export default function AdminPage() {
           {weekRiders.length > 0 ? (
             <>
               <div className="member-tags">
-                {(showPendingOnly ? weekRiders.filter((r) => !namesWithShifts.has(r.rider_id)) : weekRiders).map((r) => (
+                {weekRiders.map((r) => (
                   <span key={r.rider_id} className={`member-tag ${namesWithShifts.has(r.rider_id) ? "" : "member-tag-pending"}`}>
                     {r.name}
                   </span>
                 ))}
               </div>
-              <label className="switch-label" style={{ marginBottom: "12px" }}>
-                <input type="checkbox" checked={showPendingOnly} onChange={(e) => setShowPendingOnly(e.target.checked)} />
-                仅显示未排班 ({weekRiders.filter((r) => !namesWithShifts.has(r.rider_id)).length}人)
-              </label>
             </>
           ) : <p style={{ fontSize: "14px", color: "var(--text-muted)" }}>暂无骑手名单，请导入 XLS</p>}
 
           {requestSummaries.length > 0 ? (
-            <div className="table-wrapper">
-              <table className="admin-table">
-                <thead>
-                  <tr>
-                    <th>骑手 ({requestSummaries.length}人)</th>
-                    {weekDays.map((day) => {
+            <>
+              <div className="bulk-panel">
+                <div className="bulk-panel-top">
+                  <div className="selection-meta">
+                    <div>
+                      <strong>{selectedRiderArray.length}</strong> / {filteredRequestSummaries.length} 已选
+                    </div>
+                    {quickFilter ? <span className="chip chip-active" onClick={() => applyQuickFilter(quickFilter)}>{quickFilter === "noRest" ? "缺排休" : quickFilter === "incomplete" ? "时段不足" : "未生成"}</span> : null}
+                    <button className="btn-secondary btn-sm" type="button" onClick={resetSelection} disabled={selectedRiderArray.length === 0}>清除选择</button>
+                  </div>
+                  <div className="filter-chips">
+                    {([
+                      { key: "noRest", label: "缺排休" },
+                      { key: "incomplete", label: "时段不足" },
+                      { key: "untouched", label: "未生成" },
+                    ] as { key: QuickFilterKey; label: string }[]).map(({ key, label }) => (
+                      <span
+                        key={key}
+                        className={`chip ${quickFilter === key ? "chip-active" : ""}`}
+                        onClick={() => applyQuickFilter(key)}
+                      >
+                        {label}
+                        <small style={{ opacity: 0.6 }}>（{riderIdsByFilter[key].length}）</small>
+                      </span>
+                    ))}
+                    <span
+                      className={`chip ${showPendingOnly ? "chip-active" : ""}`}
+                      onClick={() => setShowPendingOnly((prev) => !prev)}
+                    >
+                      仅未排班
+                      <small style={{ opacity: 0.6 }}>（{weekRiders.filter((r) => !namesWithShifts.has(r.rider_id)).length}）</small>
+                    </span>
+                  </div>
+                </div>
+
+                <div className="filter-bar">
+                  <input
+                    className="filter-input"
+                    type="text"
+                    placeholder="搜索骑手姓名..."
+                    value={searchText}
+                    onChange={(e) => setSearchText(e.target.value)}
+                  />
+                  <select
+                    className="filter-select"
+                    value={groupFilter}
+                    onChange={(e) => setGroupFilter(e.target.value)}
+                  >
+                    <option value="">全部组别</option>
+                    {groups.map((g) => (
+                      <option key={g.id} value={g.id}>{g.name}</option>
+                    ))}
+                  </select>
+                  {(searchText || groupFilter || showPendingOnly || quickFilter) ? (
+                    <button className="btn-ghost btn-sm" type="button" onClick={() => { setSearchText(""); setGroupFilter(""); setShowPendingOnly(false); setQuickFilter(null); }}>
+                      清除筛选
+                    </button>
+                  ) : null}
+                  <span style={{ fontSize: "13px", color: "var(--text-muted)", marginLeft: "auto", whiteSpace: "nowrap" }}>
+                    筛选 {filteredRequestSummaries.length}/{requestSummaries.length} 人
+                  </span>
+                </div>
+
+                <div className="bulk-actions-grid">
+                  <div className="bulk-action-card">
+                    <div>
+                      <h4>套用指定时段</h4>
+                      <p>选择单个时段套用到选中骑手的非排休日</p>
+                    </div>
+                    {selectableSlots.length > 0 && (
+                      <div className="inline-input" style={{ flexWrap: "wrap" }}>
+                        {selectableSlots.map((slot) => (
+                          <span
+                            key={slot.id}
+                            className={`chip ${applySlotId === slot.id ? "chip-active" : ""}`}
+                            onClick={() => setApplySlotId(applySlotId === slot.id ? "" : slot.id)}
+                          >
+                            {slot.name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <footer>
+                      <div className="bulk-meta">{applySlotId ? `已选：${slotMap[applySlotId]?.name ?? ""}` : "请选择时段"}</div>
+                      <button
+                        className="btn-primary btn-sm"
+                        type="button"
+                        onClick={() => void handleBulkAction("apply-slot")}
+                        disabled={bulkLoading || !applySlotId}
+                      >
+                        {pendingAction === "apply-slot" ? "处理中..." : "套用"}
+                      </button>
+                    </footer>
+                  </div>
+                  <div className="bulk-action-card">
+                    <div>
+                      <h4>批量设为排休</h4>
+                      <p>指定日期，一键为选中骑手安排排休</p>
+                    </div>
+                    <div className="inline-input">
+                      <input type="date" value={bulkRestDate} onChange={(e) => setBulkRestDate(e.target.value)} />
+                      <span className="bulk-note">先选择日期再执行</span>
+                    </div>
+                    <footer>
+                      <div className="bulk-meta">名额会自动校验</div>
+                      <button
+                        className="btn-primary btn-sm"
+                        type="button"
+                        onClick={() => void handleBulkAction("set-rest")}
+                        disabled={bulkLoading || !bulkRestDate}
+                      >
+                        {pendingAction === "set-rest" ? "处理中..." : "安排排休"}
+                      </button>
+                    </footer>
+                  </div>
+                  <div className="bulk-action-card">
+                    <div>
+                      <h4>取消排休</h4>
+                      <p>清除选中骑手的排休记录，可选特定日期或整周</p>
+                    </div>
+                    <div className="inline-input">
+                      <input type="date" value={bulkRestDate} onChange={(e) => setBulkRestDate(e.target.value)} placeholder="可选" />
+                      <span className="bulk-note">留空 = 清除整周排休</span>
+                    </div>
+                    <footer>
+                      <div className="bulk-meta">批量快速恢复出勤</div>
+                      <button
+                        className="btn-secondary btn-sm"
+                        type="button"
+                        onClick={() => void handleBulkAction("clear-rest")}
+                        disabled={bulkLoading}
+                      >
+                        {pendingAction === "clear-rest" ? "处理中..." : "取消排休"}
+                      </button>
+                    </footer>
+                  </div>
+                  <div className="bulk-action-card">
+                    <div>
+                      <h4>清空排班</h4>
+                      <p>移除选中骑手本周所有排班记录</p>
+                    </div>
+                    <footer>
+                      <div className="bulk-meta">支持重新分配</div>
+                      <button
+                        className="btn-secondary btn-sm"
+                        type="button"
+                        onClick={() => void handleBulkAction("clear-schedules")}
+                        disabled={bulkLoading}
+                      >
+                        {pendingAction === "clear-schedules" ? "处理中..." : "清空排班"}
+                      </button>
+                    </footer>
+                  </div>
+                </div>
+              </div>
+
+              {filteredRequestSummaries.length > 0 ? (
+              <div className="table-wrapper">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th style={{ width: "42px" }}>
+                        <input
+                          ref={masterSelectRef}
+                          type="checkbox"
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              const allIds = filteredRequestSummaries.map((item) => item.riderId);
+                              setSelectedRiderIds(new Set(allIds));
+                            } else {
+                              resetSelection();
+                            }
+                          }}
+                        />
+                      </th>
+                      <th>骑手 ({filteredRequestSummaries.length}人)</th>
+                      {weekDays.map((day) => {
                       const rc = restCounts[day.key] ?? { used: 0, limit: 0 };
                       const full = rc.used >= rc.limit;
                       return (
@@ -497,21 +920,49 @@ export default function AdminPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {requestSummaries.map((item) => (
-                    <tr key={item.riderId}>
-                      <td>{item.riderName}</td>
-                      {item.dayTexts.map((text, i) => {
-                        const state = text.substring(text.indexOf(" ") + 1);
-                        let cls = "work";
-                        if (state === "排休") cls = "rest";
-                        if (state === "未生成" || state === "未选") cls = "missing";
-                        return <td key={i}><span className={`status-badge ${cls}`}>{state}</span></td>;
-                      })}
-                    </tr>
-                  ))}
+                  {filteredRequestSummaries.map((item) => {
+                    const status = riderStatusMap[item.riderId];
+                    const isSelected = selectedRiderIds.has(item.riderId);
+                    return (
+                      <tr key={item.riderId} style={isSelected ? { background: "rgba(245, 158, 11, 0.08)" } : undefined}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleRiderSelection(item.riderId)}
+                          />
+                        </td>
+                        <td style={{ textAlign: "left" }}>
+                          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                            <span style={{ fontWeight: 600 }}>{item.riderName}</span>
+                            {status ? (
+                              <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                                {status.hasRest ? "已有排休" : "缺排休"} · {status.totalSelected}/{status.totalEntries * (activeWeek?.required_slots ?? 0)} 时段
+                              </span>
+                            ) : null}
+                          </div>
+                        </td>
+                        {item.dayTexts.map((text, i) => {
+                          const state = text.substring(text.indexOf(" ") + 1);
+                          let cls = "work";
+                          if (state === "排休") cls = "rest";
+                          if (state === "未生成" || state === "未选") cls = "missing";
+                          return (
+                            <td key={i}>
+                              <span className={`status-badge ${cls}`}>{state}</span>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
                 </tbody>
-              </table>
-            </div>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">未找到匹配的骑手</div>
+            )}
+            </>
           ) : null}
         </section>
       ) : null}

@@ -232,6 +232,49 @@ begin
 end;
 $$;
 
+-- 将 XLS 快照中的日期文本统一为 YYYYMMDD，用于与 rider_schedules 匹配
+create or replace function public.normalize_map_date_key(p_text text)
+returns text language plpgsql immutable
+as $$
+declare
+  v_clean text;
+  v_date date;
+begin
+  if p_text is null or btrim(p_text) = '' then
+    return '';
+  end if;
+
+  v_clean := btrim(p_text);
+  if v_clean ~ '^\d{8}$' then
+    return v_clean;
+  end if;
+
+  begin
+    v_date := v_clean::date;
+    return to_char(v_date, 'YYYYMMDD');
+  exception when others then
+    null;
+  end;
+
+  v_clean := regexp_replace(v_clean, '[^0-9]', '', 'g');
+  if length(v_clean) = 8 then
+    return v_clean;
+  end if;
+
+  -- Excel 日期序列号（如 45809）
+  if v_clean ~ '^\d{4,6}$' then
+    begin
+      v_date := date '1899-12-30' + v_clean::int;
+      return to_char(v_date, 'YYYYMMDD');
+    exception when others then
+      null;
+    end;
+  end if;
+
+  return btrim(p_text);
+end;
+$$;
+
 create or replace function public.export_xls_week(p_week_id uuid)
 returns jsonb language plpgsql
 as $$
@@ -268,14 +311,16 @@ begin
 
   select jsonb_object_agg(key, value) into selection_map
   from (
-    select rs.rider_id || '_' || to_char(rs.work_date, 'YYYYMMDD') as key,
+    select btrim(rs.rider_id) || '_' || to_char(rs.work_date, 'YYYYMMDD') as key,
            jsonb_object_agg(array_idx::text, to_jsonb((rs.is_selected is true)::int)) as value
     from (
       select rs.rider_id, rs.work_date, rs.is_selected, rs.slot_id,
              array_position(v_slot_ids, rs.slot_id) as array_idx
       from public.rider_schedules rs
       join public.time_slots ts on ts.id = rs.slot_id
-      where rs.week_id = p_week_id and rs.slot_id is not null
+      where rs.week_id = p_week_id
+        and rs.slot_id is not null
+        and array_position(v_slot_ids, rs.slot_id) is not null
     ) rs
     group by rs.rider_id, rs.work_date
   ) s;
@@ -335,7 +380,7 @@ begin
         arr[4] := coalesce(rider_rec.name, '');
         arr[5] := to_char(cur_date, 'YYYYMMDD');
         arr[6] := coalesce(rider_rec.rider_type, '');
-        map_key := coalesce(rider_rec.rider_id, '') || '_' || to_char(cur_date, 'YYYYMMDD');
+        map_key := btrim(coalesce(rider_rec.rider_id, '')) || '_' || to_char(cur_date, 'YYYYMMDD');
         slot_json := coalesce(selection_map -> map_key, '{}'::jsonb);
         for idx in 1..slot_count loop
           arr[base_columns + idx] := coalesce(slot_json->>(idx::text), '0');
@@ -365,6 +410,14 @@ begin
   base_columns := coalesce(v_snapshot.base_columns, 6);
   header_len := coalesce(array_length(header_text, 1), 0);
   slot_count := coalesce(array_length(slot_col_positions, 1), 0);
+
+  if slot_count = 0 and v_slot_ids is not null then
+    slot_count := coalesce(array_length(v_slot_ids, 1), 0);
+    slot_col_positions := ARRAY(
+      SELECT base_columns + i - 1 FROM generate_series(1, slot_count) g(i)
+    );
+  end if;
+
   rider_col := coalesce(array_position(header_text, '骑手ID'), 3);
   date_col := coalesce(array_position(header_text, '日期'), 5);
 
@@ -378,8 +431,8 @@ begin
       end if;
     end loop;
 
-    rider_id := coalesce(arr[rider_col], '');
-    date_key := coalesce(arr[date_col], '');
+    rider_id := btrim(coalesce(arr[rider_col], ''));
+    date_key := public.normalize_map_date_key(arr[date_col]);
     map_key := rider_id || '_' || date_key;
     slot_json := coalesce(selection_map -> map_key, '{}'::jsonb);
 
@@ -531,6 +584,244 @@ begin
   do update set is_selected = true;
 
   return jsonb_build_object('success', true, 'selected', true);
+end;
+$$;
+
+-- 批量设置排休
+create or replace function public.bulk_set_rider_rest(
+  p_week_id uuid,
+  p_rider_ids text[],
+  p_work_date date
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_week_start date;
+  v_limit integer;
+  v_used integer;
+  v_applied integer := 0;
+  v_failed text[] := array[]::text[];
+  v_rider text;
+  v_has_rest boolean;
+begin
+  if p_rider_ids is null or array_length(p_rider_ids, 1) is null then
+    return jsonb_build_object('success', false, 'message', '未提供骑手名单');
+  end if;
+
+  select start_date into v_week_start from public.schedule_weeks where id = p_week_id;
+  if v_week_start is null then
+    return jsonb_build_object('success', false, 'message', '排班周不存在');
+  end if;
+
+  -- 确保排休名额存在
+  select max_slots into v_limit
+  from public.rest_day_limits
+  where week_start = v_week_start and rest_date = p_work_date;
+
+  if v_limit is null then
+    v_limit := public.ensure_default_day_limit(v_week_start, p_work_date);
+  end if;
+
+  select count(*) into v_used
+  from public.rider_schedules
+  where week_id = p_week_id and work_date = p_work_date and slot_id is null;
+
+  for v_rider in select unnest(p_rider_ids)
+  loop
+    select exists(
+      select 1 from public.rider_schedules
+      where rider_id = v_rider and work_date = p_work_date and slot_id is null
+    ) into v_has_rest;
+
+    if v_has_rest then
+      continue;
+    end if;
+
+    if v_used >= v_limit then
+      v_failed := array_append(v_failed, v_rider);
+      continue;
+    end if;
+
+    -- 删除当日所有出勤
+    delete from public.rider_schedules
+    where rider_id = v_rider and work_date = p_work_date and slot_id is not null;
+
+    insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+    values (v_rider, p_week_id, p_work_date, null, null)
+    on conflict (rider_id, work_date) where slot_id is null do nothing;
+
+    v_used := v_used + 1;
+    v_applied := v_applied + 1;
+  end loop;
+
+  return jsonb_build_object(
+    'success', true,
+    'processed', v_applied,
+    'failed', v_failed
+  );
+end;
+$$;
+
+-- 批量取消排休（若未指定日期则清除整周排休）
+create or replace function public.bulk_clear_rider_rest(
+  p_week_id uuid,
+  p_rider_ids text[],
+  p_work_date date default null
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_removed integer := 0;
+begin
+  if p_rider_ids is null or array_length(p_rider_ids, 1) is null then
+    return jsonb_build_object('success', false, 'message', '未提供骑手名单');
+  end if;
+
+  if p_work_date is null then
+    delete from public.rider_schedules
+    where week_id = p_week_id
+      and rider_id = any(p_rider_ids)
+      and slot_id is null;
+    get diagnostics v_removed = row_count;
+  else
+    delete from public.rider_schedules
+    where week_id = p_week_id
+      and rider_id = any(p_rider_ids)
+      and work_date = p_work_date
+      and slot_id is null;
+    get diagnostics v_removed = row_count;
+  end if;
+
+  return jsonb_build_object('success', true, 'removed', v_removed);
+end;
+$$;
+
+-- 批量套用默认时段
+create or replace function public.bulk_apply_default_slots(
+  p_week_id uuid,
+  p_rider_ids text[]
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_defaults uuid[];
+  v_start date;
+  v_end date;
+  v_day date;
+  v_rider text;
+  v_slot uuid;
+  v_processed integer := 0;
+begin
+  select default_slot_ids, start_date, end_date
+  into v_defaults, v_start, v_end
+  from public.schedule_weeks
+  where id = p_week_id;
+
+  if v_defaults is null or array_length(v_defaults, 1) is null then
+    return jsonb_build_object('success', false, 'message', '当前周未配置默认时段');
+  end if;
+
+  if p_rider_ids is null or array_length(p_rider_ids, 1) is null then
+    return jsonb_build_object('success', false, 'message', '未提供骑手名单');
+  end if;
+
+  for v_rider in select unnest(p_rider_ids)
+  loop
+    v_day := v_start;
+    while v_day <= v_end loop
+      -- 清除当天所有记录（排休+出勤）
+      delete from public.rider_schedules
+      where rider_id = v_rider and work_date = v_day;
+
+      -- 插入默认时段
+      foreach v_slot in array v_defaults
+      loop
+        insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+        values (v_rider, p_week_id, v_day, v_slot, true)
+        on conflict (rider_id, work_date, slot_id) where slot_id is not null
+        do update set is_selected = true;
+      end loop;
+
+      v_day := v_day + interval '1 day';
+    end loop;
+    v_processed := v_processed + 1;
+  end loop;
+
+  return jsonb_build_object('success', true, 'processed', v_processed);
+end;
+$$;
+
+-- 批量套用指定时段（跳过排休日）
+create or replace function public.bulk_apply_slot(
+  p_week_id uuid,
+  p_rider_ids text[],
+  p_slot_id uuid
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_start date;
+  v_end date;
+  v_day date;
+  v_rider text;
+  v_processed integer := 0;
+  v_skipped integer := 0;
+  v_has_rest boolean;
+begin
+  select start_date, end_date into v_start, v_end
+  from public.schedule_weeks where id = p_week_id;
+
+  if p_rider_ids is null or array_length(p_rider_ids, 1) is null then
+    return jsonb_build_object('success', false, 'message', '未提供骑手名单');
+  end if;
+
+  for v_rider in select unnest(p_rider_ids)
+  loop
+    v_day := v_start;
+    while v_day <= v_end loop
+      select exists(
+        select 1 from public.rider_schedules
+        where rider_id = v_rider and work_date = v_day and slot_id is null
+      ) into v_has_rest;
+
+      if v_has_rest then
+        v_skipped := v_skipped + 1;
+      else
+        insert into public.rider_schedules (rider_id, week_id, work_date, slot_id, is_selected)
+        values (v_rider, p_week_id, v_day, p_slot_id, true)
+        on conflict (rider_id, work_date, slot_id) where slot_id is not null
+        do update set is_selected = true;
+        v_processed := v_processed + 1;
+      end if;
+
+      v_day := v_day + interval '1 day';
+    end loop;
+  end loop;
+
+  return jsonb_build_object('success', true, 'processed', v_processed, 'skipped', v_skipped);
+end;
+$$;
+
+-- 批量清空骑手当周排班
+create or replace function public.bulk_clear_rider_schedules(
+  p_week_id uuid,
+  p_rider_ids text[]
+)
+returns jsonb language plpgsql
+as $$
+declare
+  v_removed integer;
+begin
+  if p_rider_ids is null or array_length(p_rider_ids, 1) is null then
+    return jsonb_build_object('success', false, 'message', '未提供骑手名单');
+  end if;
+
+  delete from public.rider_schedules
+  where week_id = p_week_id
+    and rider_id = any(p_rider_ids);
+  get diagnostics v_removed = row_count;
+
+  return jsonb_build_object('success', true, 'removed', v_removed);
 end;
 $$;
 
@@ -806,6 +1097,10 @@ grant execute on function public.get_week_slots to anon, authenticated;
 grant execute on function public.toggle_slot_selectable to anon, authenticated;
 grant execute on function public.set_week_required_slots to anon, authenticated;
 grant execute on function public.set_week_default_slots to anon, authenticated;
+grant execute on function public.bulk_set_rider_rest to anon, authenticated;
+grant execute on function public.bulk_clear_rider_rest to anon, authenticated;
+grant execute on function public.bulk_apply_default_slots to anon, authenticated;
+grant execute on function public.bulk_clear_rider_schedules to anon, authenticated;
 grant execute on function public.switch_rider_slot to anon, authenticated;
 grant execute on function public.toggle_rider_slot to anon, authenticated;
 grant execute on function public.set_rider_rest to anon, authenticated;

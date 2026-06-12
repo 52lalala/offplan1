@@ -17,6 +17,38 @@ function extractSlotName(label: string): string {
   return label.slice(0, idx).trim();
 }
 
+function pad2(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+/** 将 XLS 日期单元格统一为 YYYYMMDD，避免导出时与数据库日期键不匹配 */
+export function normalizeXlsDate(value: unknown): string {
+  if (value == null || value === "") return "";
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const parsed = XLSX.SSF?.parse_date_code?.(value);
+    if (parsed) {
+      return `${parsed.y}${pad2(parsed.m)}${pad2(parsed.d)}`;
+    }
+    const utc = Math.round((value - 25569) * 86400 * 1000);
+    const date = new Date(utc);
+    return `${date.getUTCFullYear()}${pad2(date.getUTCMonth() + 1)}${pad2(date.getUTCDate())}`;
+  }
+
+  const str = String(value).trim();
+  if (/^\d{8}$/.test(str)) return str;
+
+  const iso = str.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (iso) {
+    return `${iso[1]}${pad2(Number(iso[2]))}${pad2(Number(iso[3]))}`;
+  }
+
+  const digits = str.replace(/\D/g, "");
+  if (digits.length === 8) return digits;
+
+  return str;
+}
+
 export function parseXlsFile(buffer: ArrayBuffer): XlsData {
   const wb = XLSX.read(buffer, { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
@@ -61,7 +93,7 @@ export function parseXlsFile(buffer: ArrayBuffer): XlsData {
   let minDate: string | null = null;
   let maxDate: string | null = null;
   for (let r = 1; r < rows.length; r++) {
-    const dateStr = String(rows[r]?.[4] ?? "").trim();
+    const dateStr = normalizeXlsDate(rows[r]?.[4]);
     if (dateStr) {
       if (!minDate || dateStr < minDate) minDate = dateStr;
       if (!maxDate || dateStr > maxDate) maxDate = dateStr;
@@ -83,7 +115,7 @@ export function parseXlsFile(buffer: ArrayBuffer): XlsData {
 
     const riderId = String(row[2] ?? "").trim();
     const riderName = String(row[3] ?? "").trim();
-    const dateStr = String(row[4] ?? "").trim();
+    const dateStr = normalizeXlsDate(row[4]);
     if (!riderId || !riderName || !dateStr) continue;
 
     const key = `${riderId}_${dateStr}`;
@@ -106,6 +138,8 @@ export function parseXlsFile(buffer: ArrayBuffer): XlsData {
       const value = row?.[i];
       if (value === undefined) {
         arr.push("");
+      } else if (i === 4) {
+        arr.push(normalizeXlsDate(value));
       } else {
         arr.push(value as string | number | null);
       }

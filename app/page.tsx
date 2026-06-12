@@ -16,7 +16,7 @@ export default function HomePage() {
       setLoading(true);
       const { data } = await supabase
         .from("schedule_weeks")
-        .select("id,name,start_date,end_date,is_active,required_slots")
+        .select("id,name,start_date,end_date,is_active,required_slots,default_slot_ids")
         .eq("is_active", true)
         .order("start_date", { ascending: false });
       const list = data ?? [];
